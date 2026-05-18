@@ -679,11 +679,11 @@ def extract_text(path):
         return "\n".join("  |  ".join(str(c) for c in r if c) for s in wb.worksheets for r in s.iter_rows(values_only=True))
     raise ValueError(f"Unsupported: {ext}")
 
-def _llm_call(system_prompt, user_text, max_tokens=4000):
+def _llm_call(system_prompt, user_text, max_tokens=4000, text_limit=12000):
     """Core LLM caller - shared by all pipelines."""
     client = Groq(api_key=GROQ_API_KEY)
-    if len(user_text) > 12000:
-        user_text = user_text[:12000]
+    if len(user_text) > text_limit:
+        user_text = user_text[:text_limit]
     if not user_text.strip():
         return None
     for attempt in range(3):
@@ -711,7 +711,9 @@ def _llm_call(system_prompt, user_text, max_tokens=4000):
 
 def classify_document(text):
     """Step 1 for Master Upload - lightweight classifier, ~200 tokens."""
-    return _llm_call(CLASSIFIER_PROMPT, text, max_tokens=200)
+    # Only feed first 3000 chars to classifier - enough to identify doc type
+    # saves TPM and avoids rate limit on the classify call
+    return _llm_call(CLASSIFIER_PROMPT, text, max_tokens=200, text_limit=3000)
 
 
 def call_llm(text, target_section=None, is_vessel=False, is_resume=False):
@@ -725,7 +727,9 @@ def call_llm(text, target_section=None, is_vessel=False, is_resume=False):
     if is_vessel:
         return _llm_call(VESSEL_PROMPT, text, max_tokens=1500)
     if is_resume:
-        return _llm_call(RESUME_PROMPT, text, max_tokens=5000)
+        # Resume gets more text but still capped to avoid TPM breach on Groq free tier
+        # 8000 chars ~ 2000 tokens input, well within 6000 TPM limit
+        return _llm_call(RESUME_PROMPT, text, max_tokens=5000, text_limit=8000)
     if target_section and target_section in SECTION_PROMPTS:
         return _llm_call(SECTION_PROMPTS[target_section], text, max_tokens=2000)
     # fallback - treat as resume/full extract
@@ -936,25 +940,22 @@ def render_section_content(section_name, rows, key_prefix, view_mode="grid"):
         return
 
     if view_mode == "table":
-        # Inline edit button per row
-        for ridx, row in enumerate(rows):
-            title = next((row.get(f,"") for f in ["Document Name","Certificate Name","Company","Institution Name","Bank Name","Vessel"] if row.get(f)), f"Record {ridx+1}")
-            drops = DROPDOWN_FIELDS.get(section_name, {})
-            invalid_fields = [cn for cn,val in row.items() if val and cn in drops and not check_dropdown_validity(section_name,cn,val)]
-            invalid_badge = f' <span class="invalid-flag">⚠ {len(invalid_fields)} invalid</span>' if invalid_fields else ""
+        cols_def = SECTION_COLUMNS.get(section_name, VESSEL_COLUMNS)
+        # Build clean dataframe
+        df = pd.DataFrame(rows)
+        for c in cols_def:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[cols_def].fillna("")
 
-            tr1, tr2 = st.columns([5, 1])
-            with tr1:
-                # Show key fields inline
-                preview = "  |  ".join(f"{k}: {v}" for k,v in row.items() if v)[:120]
-                st.markdown(
-                    f'<div class="field-value" style="margin-bottom:4px;">'
-                    f'<b>{title}</b>{invalid_badge}<br>'
-                    f'<span style="font-size:0.72rem;color:#64748b;">{preview}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-            with tr2:
+        # Render table and edit buttons side by side
+        t_col, e_col = st.columns([6, 1])
+        with t_col:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        with e_col:
+            # Spacer to align with table header row
+            st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
+            for ridx, row in enumerate(rows):
                 if st.button("Edit", key=f"{key_prefix}_tbl_edit_{ridx}", use_container_width=True):
                     st.session_state["subpopup"] = {
                         "section": section_name, "row_idx": ridx,
@@ -962,7 +963,8 @@ def render_section_content(section_name, rows, key_prefix, view_mode="grid"):
                         "source": "profile"
                     }
                     st.rerun()
-            st.markdown("<div style='height:2px'></div>", unsafe_allow_html=True)
+                # Spacer between buttons to roughly align with rows
+                st.markdown("<div style='height:21px'></div>", unsafe_allow_html=True)
     else:
         # Grid card view - show ALL fields in card
         for i in range(0, len(rows), 2):
@@ -1270,6 +1272,15 @@ def render_popup():
     pending_vessel = popup.get("pending_vessel")
 
     with st.expander(f"Review & Approve - {filename}", expanded=True):
+
+        # Doc tank status banner
+        if popup.get("source") == "doc_tank":
+            tank_status = popup.get("tank_status", "Pending")
+            if tank_status == "Approved":
+                st.success(f"This document was previously approved. Re-approving will only fill currently empty fields.")
+            else:
+                st.warning("This document is pending approval. Review and approve below.")
+
         m1,m2,m3 = st.columns(3)
         m1.metric("Document Type", doc_type)
         m2.metric("Vessel Document", "Yes" if is_vessel else "No")
@@ -1354,14 +1365,32 @@ def render_popup():
         st.markdown("---")
         ba,bb,bc = st.columns([2,2,1])
         with ba:
-            if st.button("Approve and Populate", type="primary", use_container_width=True, key="approve_popup"):
+            # Label changes based on source and prior approval status
+            tank_status = popup.get("tank_status", "Pending")
+            is_dt_source = popup.get("source") == "doc_tank"
+            btn_approve_label = "Re-Approve (fill empty only)" if (is_dt_source and tank_status == "Approved") else "Approve and Populate"
+
+            if st.button(btn_approve_label, type="primary", use_container_width=True, key="approve_popup"):
                 approve_and_populate(result, is_vessel, pending_rows, pending_vessel, personal)
 
-                # Mark the doc tank entry as approved
+                # Build approved fields list for doc tank display
+                approved_fields = []
+                if not is_vessel:
+                    approved_fields += [v for v in personal.values() if v]
+                    for sec_rows in pending_rows.values():
+                        for row in sec_rows:
+                            for k, v in row.items():
+                                if v:
+                                    approved_fields.append(f"{k}: {v[:30]}")
+                if is_vessel and pending_vessel:
+                    approved_fields += [f"{k}: {v[:30]}" for k,v in pending_vessel.items() if v]
+
+                # Mark the doc tank entry as approved + store approved fields
                 tank_id = popup.get("tank_id")
                 for dt_entry in st.session_state["doc_tank"]:
                     if dt_entry.get("tank_id") == tank_id:
                         dt_entry["status"] = "Approved"
+                        dt_entry["approved_fields"] = approved_fields
                         break
 
                 st.session_state["popup"] = None
@@ -1373,8 +1402,10 @@ def render_popup():
                 file_name=f"{Path(filename).stem}_raw.json",
                 mime="application/json", key="dl_popup", use_container_width=True)
         with bc:
-            if st.button("Discard", use_container_width=True, key="discard_popup"):
-                st.session_state["popup"]=None; st.rerun()
+            discard_label = "Close" if popup.get("source") == "doc_tank" else "Discard"
+            if st.button(discard_label, use_container_width=True, key="discard_popup"):
+                st.session_state["popup"] = None
+                st.rerun()
 
 # ── HEADER ────────────────────────────────────────────────────
 col_brand,col_master = st.columns([3,1])
@@ -1668,88 +1699,57 @@ elif st.session_state["page"] == "Doc Tank":
 
         for i, doc in enumerate(reversed(tank)):
             idx = len(tank) - 1 - i
-            status     = doc.get("status","Pending")
-            status_cls = "status-matched" if status=="Approved" else "status-verify"
-            label      = f"[{doc['timestamp']}]  {doc['filename']}  -  {doc['document_type']}  "
+            status     = doc.get("status", "Pending")
+            status_cls = "status-matched" if status == "Approved" else "status-verify"
 
-            with st.expander(label, expanded=(i==0)):
-                # Header row
-                h1,h2,h3,h4 = st.columns(4)
-                h1.metric("Uploaded",      doc["timestamp"])
-                h2.metric("Document Type", doc["document_type"])
-                h3.metric("Vessel Doc",    "Yes" if doc.get("is_vessel") else "No")
-                with h4:
-                    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-                    st.markdown(f'<span class="{status_cls}" style="font-size:0.85rem;padding:4px 14px;">{status}</span>', unsafe_allow_html=True)
+            # Approved fields summary for display
+            approved_fields = doc.get("approved_fields", [])
 
-                raw        = doc.get("raw_result", {})
-                is_vessel  = doc.get("is_vessel", False)
-                is_resume  = doc.get("is_resume", False)
+            col_label, col_status, col_open, col_del = st.columns([4, 1, 1, 1])
 
-                # Build pending rows for display + re-approve
-                pending_rows   = result_to_rows(raw)
-                pending_rows   = reclassify_courses_and_licenses(pending_rows)
-                pending_vessel = vessel_result_to_row(raw) if is_vessel else None
-                personal       = raw.get("personal", {})
+            with col_label:
+                st.markdown(
+                    f'<div style="padding:8px 0;">'
+                    f'<div style="font-size:0.85rem;font-weight:600;color:#1e293b;">{doc["filename"]}</div>'
+                    f'<div style="font-size:0.72rem;color:#64748b;">{doc["timestamp"]} &nbsp;|&nbsp; {doc["document_type"]}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+            with col_status:
+                st.markdown(
+                    f'<div style="padding-top:12px;">'
+                    f'<span class="{status_cls}">{status}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+            with col_open:
+                if st.button("Open", key=f"dt_open_{idx}", use_container_width=True):
+                    # Load this doc tank entry into popup state
+                    # exactly as if it was just uploaded
+                    raw = doc.get("raw_result", {})
+                    st.session_state["popup"] = {
+                        "key":            f"dt_{idx}",
+                        "result":         raw,
+                        "filename":       doc["filename"],
+                        "source":         "doc_tank",
+                        "target_section": doc.get("target_section", ""),
+                        "tank_id":        doc.get("tank_id", ""),
+                        "tank_idx":       idx,
+                        "tank_status":    status,
+                        "approved_fields": approved_fields,
+                    }
+                    st.rerun()
+            with col_del:
+                if st.button("Delete", key=f"dt_del_{idx}", use_container_width=True):
+                    st.session_state["doc_tank"].pop(idx)
+                    st.rerun()
 
-                st.markdown("---")
+            # Show approved fields summary if doc was approved
+            if approved_fields:
+                with st.expander(f"Approved fields ({len(approved_fields)})", expanded=False):
+                    af_cols = st.columns(3)
+                    for afi, af in enumerate(approved_fields):
+                        with af_cols[afi % 3]:
+                            st.markdown(f'<span class="status-matched" style="margin:2px;display:inline-block;">{af}</span>', unsafe_allow_html=True)
 
-                # Personal info
-                if not is_vessel and any(v for v in personal.values()):
-                    st.markdown('<div class="section-label">Personal Information</div>', unsafe_allow_html=True)
-                    p_items = [(k,v) for k,v in personal.items() if v]
-                    for pi in range(0, len(p_items), 3):
-                        chunk = p_items[pi:pi+3]
-                        pcols = st.columns(3)
-                        for pj,(pk,pv) in enumerate(chunk):
-                            with pcols[pj]:
-                                st.markdown(f'<div class="field-label">{pk.replace("_"," ").title()}</div>', unsafe_allow_html=True)
-                                st.markdown(f'<div class="field-value">{pv}</div>', unsafe_allow_html=True)
-
-                # Section rows as dataframes
-                if not is_vessel:
-                    for sec_name, sec_rows in pending_rows.items():
-                        if not sec_rows: continue
-                        valid_rows = [r for r in sec_rows if any(v for v in r.values())]
-                        if not valid_rows: continue
-                        st.markdown(f'<div class="section-label">{sec_name} - {len(valid_rows)} record(s)</div>', unsafe_allow_html=True)
-                        cols_def = SECTION_COLUMNS.get(sec_name, [])
-                        df = pd.DataFrame(valid_rows)
-                        for c in cols_def:
-                            if c not in df.columns: df[c] = ""
-                        df = df[cols_def].fillna("")
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-
-                # Vessel cert
-                if is_vessel and pending_vessel:
-                    st.markdown('<div class="section-label">Vessel Certificate</div>', unsafe_allow_html=True)
-                    vc_items = [(k,v) for k,v in pending_vessel.items() if v]
-                    for vi in range(0, len(vc_items), 3):
-                        chunk = vc_items[vi:vi+3]
-                        vcols = st.columns(3)
-                        for vj,(vk,vv) in enumerate(chunk):
-                            with vcols[vj]:
-                                st.markdown(f'<div class="field-label">{vk.replace("_"," ").title()}</div>', unsafe_allow_html=True)
-                                st.markdown(f'<div class="field-value">{vv}</div>', unsafe_allow_html=True)
-
-                st.markdown("---")
-                da, db, dc = st.columns(3)
-
-                with da:
-                    btn_label = "Approve and Populate" if status == "Pending" else "Re-Approve (fill empty only)"
-                    if st.button(btn_label, type="primary", use_container_width=True, key=f"dt_approve_{idx}"):
-                        approve_and_populate(raw, is_vessel, pending_rows, pending_vessel, personal)
-                        st.session_state["doc_tank"][idx]["status"] = "Approved"
-                        st.success("Populated successfully.")
-                        st.rerun()
-
-                with db:
-                    st.download_button("Download Raw JSON",
-                        data=json.dumps(raw, indent=2),
-                        file_name=f"{Path(doc['filename']).stem}_raw.json",
-                        mime="application/json", key=f"dlr_{idx}")
-
-                with dc:
-                    if st.button("Delete Entry", use_container_width=True, key=f"dt_del_{idx}"):
-                        st.session_state["doc_tank"].pop(idx)
-                        st.rerun()
+            st.markdown("<hr style='margin:4px 0;border-color:#f1f5f9;'>", unsafe_allow_html=True)
