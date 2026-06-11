@@ -1,5 +1,6 @@
 import streamlit as st
 import json, re, os, tempfile, copy
+from difflib import SequenceMatcher
 from pathlib import Path
 from datetime import datetime
 from groq import Groq
@@ -10,7 +11,7 @@ from docx import Document as DocxDocument
 import openpyxl
 import pandas as pd
 
-st.set_page_config(page_title="SeaBotics.ai", page_icon="S", layout="wide")
+st.set_page_config(page_title="SeaBotics.ai", page_icon="S", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
@@ -235,6 +236,18 @@ ALL_MEDICAL_TYPES  = list(MEDICAL_DROPDOWN.keys())
 ALL_VESSEL_CATS    = list(VESSEL_CERT_CATEGORIES.keys())
 ALL_VESSEL_NAMES   = [n for names in VESSEL_CERT_CATEGORIES.values() for n in names]
 
+ALL_GENDER_OPTIONS    = ["Male", "Female", "Prefer Not to mention", "Other"]
+ALL_RANK_OPTIONS      = [
+    "Master", "Chief Officer", "Second Officer", "Third Officer",
+    "Chief Engineer", "Second Engineer", "Third Engineer", "Fourth Engineer",
+    "Electrical Officer", "Bosun", "Able Seaman", "Ordinary Seaman",
+    "Deck Cadet", "Engine Cadet", "Fitter", "Oiler", "Wiper",
+    "Chief Steward", "Steward", "Cook", "Messman",
+]
+ALL_SHIRT_SIZES       = ["XS", "S", "M", "L", "XL", "XXL", "XXXL"]
+ALL_TROUSER_SIZES     = ["XS", "S", "M", "L", "XL", "XXL", "XXXL"]
+ALL_BOILER_SUIT_SIZES = ["XS", "S", "M", "L", "XL", "XXL", "XXXL"]
+
 # ── SECTION DEFINITIONS ───────────────────────────────────────
 PERSONAL_FIELDS = [
     ("person_name","Full Name"),("surname","Surname"),("email","Email"),
@@ -285,6 +298,13 @@ DROPDOWN_FIELDS = {
         "Certificate Category": ALL_VESSEL_CATS,
         "Certificate Name":     ALL_VESSEL_NAMES,
         "Type":                 VESSEL_CERT_TYPES,
+    },
+    "Personal Information": {
+        "Gender":           ALL_GENDER_OPTIONS,
+        "Current Rank":     ALL_RANK_OPTIONS,
+        "Shirt Size":       ALL_SHIRT_SIZES,
+        "Trouser Size":     ALL_TROUSER_SIZES,
+        "Boiler Suit Size": ALL_BOILER_SUIT_SIZES,
     },
 }
 
@@ -402,23 +422,24 @@ def init_state():
     if "doc_tank" not in st.session_state: st.session_state["doc_tank"] = []
     if "popup"    not in st.session_state: st.session_state["popup"]    = None
     if "subpopup" not in st.session_state: st.session_state["subpopup"] = None
-    if "page"     not in st.session_state: st.session_state["page"]     = "My Profile"
+    if "page"     not in st.session_state: st.session_state["page"]     = "Crew"
     if "dt_popup" not in st.session_state: st.session_state["dt_popup"] = None
 
-def save_to_doc_tank(result, filename, source, doc_type, is_vessel, is_resume):
+def save_to_doc_tank(result, filename, source, doc_type, is_vessel, is_resume, section_name=None):
     """Save any uploaded doc to doc tank immediately as draft."""
     # Avoid duplicate entries for same filename+timestamp
     ts = datetime.now().strftime("%d-%b-%Y %H:%M")
     st.session_state["doc_tank"].append({
-        "timestamp":   ts,
-        "filename":    filename,
-        "source":      source,
+        "timestamp":     ts,
+        "filename":      filename,
+        "source":        source,
+        "section_name":  section_name or "",
         "document_type": doc_type,
-        "is_vessel":   is_vessel,
-        "is_resume":   is_resume,
-        "raw_result":  result,
-        "status":      "Pending",
-        "tank_id":     f"{filename}_{ts}",
+        "is_vessel":     is_vessel,
+        "is_resume":     is_resume,
+        "raw_result":    result,
+        "status":        "Pending",
+        "tank_id":       f"{filename}_{ts}",
     })
 
 init_state()
@@ -741,6 +762,75 @@ def conf_color(c):
     if c>0.00:  return "#ef4444"
     return "#e2e8f0"
 
+def field_coherence(field_label, value):
+    """Return 0.0-1.0 coherence score for a free-text value given its field label."""
+    if not value:
+        return 0.0
+    v    = value.strip()
+    fl   = field_label.lower()
+    _len = max(len(v), 1)
+    # Name fields: only letters, spaces, hyphens, apostrophes, dots
+    if fl in ("full name", "surname"):
+        valid = len(re.findall(r"[a-zA-Z \-\.\']", v))
+        return round(valid / _len, 2)
+    # Numeric fields
+    if fl in ("height", "weight"):
+        return 1.0 if re.match(r"^\d+(\.\d+)?\s*(cm|kg|lbs?|m)?$", v, re.IGNORECASE) else 0.3
+    # Email
+    if fl == "email":
+        return 1.0 if re.match(r"^[\w.+\-]+@[\w\-]+\.[\w.]+$", v) else 0.2
+    # Phone
+    if fl == "contact number":
+        valid = len(re.findall(r"[\d\+\-\(\) ]", v))
+        return round(min(1.0, valid / _len), 2)
+    # Document ID numbers
+    if fl in ("passport number", "cdc / seaman's book number"):
+        valid = len(re.findall(r"[a-zA-Z0-9\-\/]", v))
+        return round(min(1.0, valid / _len), 2)
+    # Mostly-alpha fields
+    if fl in ("nationality", "country", "state", "address"):
+        valid = len(re.findall(r"[a-zA-Z0-9 \-\/\.,]", v))
+        return round(min(1.0, valid / _len), 2)
+    # Date fields - defer to validate_field_value flag
+    if "date" in fl:
+        _, flag = validate_field_value(field_label, v)
+        return 0.7 if flag else 1.0
+    # General: penalise obviously junk characters ($#@!%^&*)
+    bad = len(re.findall(r"[$#@!%^&*=|<>~`]", v))
+    if bad == 0:
+        return 1.0
+    return max(0.1, round(1.0 - (bad / _len) * 3, 2))
+
+def render_field_alerts(issues):
+    """Render a compact inline badge strip summarising field issues.
+    issues: list of (field_label, status) or (field_label, status, note)
+    status in ("Invalid", "Verify", "Missing")
+    """
+    if not issues:
+        return
+    n_inv = sum(1 for x in issues if x[1] == "Invalid")
+    n_ver = sum(1 for x in issues if x[1] == "Verify")
+    n_mis = sum(1 for x in issues if x[1] == "Missing")
+    badges = []
+    if n_inv:
+        badges.append(
+            f"<span style=\"background:#fef2f2;color:#ef4444;padding:2px 7px;border-radius:4px;font-size:0.7rem;font-weight:600;\">{n_inv} Invalid</span>"
+        )
+    if n_ver:
+        badges.append(
+            f"<span style=\"background:#fffbeb;color:#d97706;padding:2px 7px;border-radius:4px;font-size:0.7rem;font-weight:600;\">{n_ver} to Verify</span>"
+        )
+    if n_mis:
+        badges.append(
+            f"<span style=\"background:#f8fafc;color:#94a3b8;padding:2px 7px;border-radius:4px;font-size:0.7rem;font-weight:600;\">{n_mis} Missing</span>"
+        )
+    st.markdown(
+        "<div style=\"display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:2px 0 8px 0;\">"
+        + "".join(badges)
+        + "</div>",
+        unsafe_allow_html=True
+    )
+
 DATE_PATTERN = re.compile(
     r"^\d{1,2}-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{4}$",
     re.IGNORECASE
@@ -948,23 +1038,8 @@ def render_section_content(section_name, rows, key_prefix, view_mode="grid"):
                 df[c] = ""
         df = df[cols_def].fillna("")
 
-        # Render table and edit buttons side by side
-        t_col, e_col = st.columns([6, 1])
-        with t_col:
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        with e_col:
-            # Spacer to align with table header row
-            st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
-            for ridx, row in enumerate(rows):
-                if st.button("Edit", key=f"{key_prefix}_tbl_edit_{ridx}", use_container_width=True):
-                    st.session_state["subpopup"] = {
-                        "section": section_name, "row_idx": ridx,
-                        "row": copy.deepcopy(row), "key": f"{key_prefix}_{ridx}",
-                        "source": "profile"
-                    }
-                    st.rerun()
-                # Spacer between buttons to roughly align with rows
-                st.markdown("<div style='height:21px'></div>", unsafe_allow_html=True)
+        # Read-only table view
+        st.dataframe(df, use_container_width=True, hide_index=True)
     else:
         # Grid card view - show ALL fields in card
         for i in range(0, len(rows), 2):
@@ -992,15 +1067,67 @@ def render_section_content(section_name, rows, key_prefix, view_mode="grid"):
                     </div>
                     """, unsafe_allow_html=True)
 
-                    if st.button("Edit", key=f"{key_prefix}_edit_{idx}", use_container_width=True):
-                        st.session_state["subpopup"] = {
-                            "section": section_name, "row_idx": idx,
-                            "row": copy.deepcopy(row), "key": f"{key_prefix}_{idx}",
-                            "source": "profile"
-                        }
-                        st.rerun()
-
 # ── SUB-POPUP (edit individual record) ───────────────────────
+ALL_ORG_OPTIONS = sorted(set([
+    "Full Name","Surname","Email Address","Gender","Phone Number","Date of Birth",
+    "Nationality","Blood Group","Rank / Designation","Identification Mark",
+    "Availability Date","Residential Address","Country","State","ZIP / PIN Code",
+    "Domestic Airport","International Airport","Passport Number",
+    "CDC / Seaman's Book Number","Height","Weight","Boiler Suit Size",
+    "Safety Shoe Size","Shirt Size","Trouser Size","Document Type","Document Name",
+    "Document / Certificate Number","Issuing Authority","Place of Issue",
+    "Date of Issue","Date of Expiry","Institution Name","Level of Education",
+    "Field of Study","Start Date","Completion Date","Bank Name","Branch Name",
+    "Account Type","Account Name","Account Number","IFSC / SWIFT Code",
+    "Company Name","IMO Number","Vessel Name","Vessel Type","Flag State",
+    "Voyage Type","Sign On Port","Sign Off Port","GRT","DWT","BHP",
+    "Main Engine Type / Model","Main Engine KW","Reason for Sign Off",
+    "Certificate Name","Certificate Category","Classification Society",
+    "Date of Survey","Other / Unclassified"
+]))
+
+ORG_PREMAP = {
+    "Document Name": "Document Name",
+    "Document Type": "Document Type",
+    "Certificate Number": "Document / Certificate Number",
+    "Date of Issue": "Date of Issue",
+    "Date of Expiry": "Date of Expiry",
+    "Place of Issue": "Place of Issue",
+    "Issuing Authority": "Issuing Authority",
+    "Type": "Document Type",
+    "Company": "Company Name",
+    "Rank": "Rank / Designation",
+    "Vessel Name": "Vessel Name",
+    "Vessel Type": "Vessel Type",
+    "Voyage Type": "Voyage Type",
+    "IMO Number": "IMO Number",
+    "Flag / Country": "Flag State",
+    "GRT": "GRT", "DWT": "DWT", "BHP": "BHP",
+    "Main Engine Type": "Main Engine Type / Model",
+    "Main Engine KW": "Main Engine KW",
+    "Sign On Port": "Sign On Port",
+    "Sign Off Port": "Sign Off Port",
+    "Start Date": "Start Date",
+    "End Date": "Sign Off Date",
+    "Reason for Sign Off": "Reason for Sign Off",
+    "Institution Name": "Institution Name",
+    "Level of Education": "Level of Education",
+    "Field of Study": "Field of Study",
+    "Completion Date": "Completion Date",
+    "Country": "Country",
+    "Bank Name": "Bank Name",
+    "Branch Name": "Branch Name",
+    "Account Type": "Account Type",
+    "Account Name": "Account Name",
+    "Account Number": "Account Number",
+    "IFSC / SWIFT Code": "IFSC / SWIFT Code",
+    "Certificate Name": "Certificate Name",
+    "Certificate Category": "Certificate Category",
+    "Vessel": "Vessel Name",
+    "Classification Society": "Classification Society",
+    "Date of Survey": "Date of Survey",
+}
+
 def render_subpopup():
     sp = st.session_state.get("subpopup")
     if not sp: return
@@ -1009,99 +1136,76 @@ def render_subpopup():
     row_idx  = sp["row_idx"]
     row      = sp["row"]
     key      = sp["key"]
-    cols_def = SECTION_COLUMNS.get(section, VESSEL_COLUMNS)
+    if section == "Personal Information":
+        cols_def = [fl for fk, fl in PERSONAL_FIELDS]
+    else:
+        cols_def = SECTION_COLUMNS.get(section, VESSEL_COLUMNS)
     drops    = DROPDOWN_FIELDS.get(section, {})
-
-    ALL_ORG_OPTIONS = sorted(set([
-        "Full Name","Surname","Email Address","Gender","Phone Number","Date of Birth",
-        "Nationality","Blood Group","Rank / Designation","Identification Mark",
-        "Availability Date","Residential Address","Country","State","ZIP / PIN Code",
-        "Domestic Airport","International Airport","Passport Number",
-        "CDC / Seaman's Book Number","Height","Weight","Boiler Suit Size",
-        "Safety Shoe Size","Shirt Size","Trouser Size","Document Type","Document Name",
-        "Document / Certificate Number","Issuing Authority","Place of Issue",
-        "Date of Issue","Date of Expiry","Institution Name","Level of Education",
-        "Field of Study","Start Date","Completion Date","Bank Name","Branch Name",
-        "Account Type","Account Name","Account Number","IFSC / SWIFT Code",
-        "Company Name","IMO Number","Vessel Name","Vessel Type","Flag State",
-        "Voyage Type","Sign On Port","Sign Off Port","GRT","DWT","BHP",
-        "Main Engine Type / Model","Main Engine KW","Reason for Sign Off",
-        "Certificate Name","Certificate Category","Classification Society",
-        "Date of Survey","Other / Unclassified"
-    ]))
-
-    ORG_PREMAP = {
-        "Document Name": "Document Name",
-        "Document Type": "Document Type",
-        "Certificate Number": "Document / Certificate Number",
-        "Date of Issue": "Date of Issue",
-        "Date of Expiry": "Date of Expiry",
-        "Place of Issue": "Place of Issue",
-        "Issuing Authority": "Issuing Authority",
-        "Type": "Document Type",
-        "Company": "Company Name",
-        "Rank": "Rank / Designation",
-        "Vessel Name": "Vessel Name",
-        "Vessel Type": "Vessel Type",
-        "Voyage Type": "Voyage Type",
-        "IMO Number": "IMO Number",
-        "Flag / Country": "Flag State",
-        "GRT": "GRT", "DWT": "DWT", "BHP": "BHP",
-        "Main Engine Type": "Main Engine Type / Model",
-        "Main Engine KW": "Main Engine KW",
-        "Sign On Port": "Sign On Port",
-        "Sign Off Port": "Sign Off Port",
-        "Start Date": "Start Date",
-        "End Date": "Sign Off Date",
-        "Reason for Sign Off": "Reason for Sign Off",
-        "Institution Name": "Institution Name",
-        "Level of Education": "Level of Education",
-        "Field of Study": "Field of Study",
-        "Completion Date": "Completion Date",
-        "Country": "Country",
-        "Bank Name": "Bank Name",
-        "Branch Name": "Branch Name",
-        "Account Type": "Account Type",
-        "Account Name": "Account Name",
-        "Account Number": "Account Number",
-        "IFSC / SWIFT Code": "IFSC / SWIFT Code",
-        "Certificate Name": "Certificate Name",
-        "Certificate Category": "Certificate Category",
-        "Vessel": "Vessel Name",
-        "Classification Society": "Classification Society",
-        "Date of Survey": "Date of Survey",
-    }
 
     with st.expander(f"Edit Record - {section}", expanded=True):
         st.markdown(f'<div class="section-label">Editing record {row_idx+1} in {section}</div>', unsafe_allow_html=True)
 
+        # Field alert strip for this row
+        _sp_issues = []
+        for _sp_col in cols_def:
+            _sp_v = row.get(_sp_col, "") or ""
+            if not _sp_v:
+                _sp_issues.append((_sp_col, "Missing"))
+                continue
+            if _sp_col in drops and not check_dropdown_validity(section, _sp_col, _sp_v):
+                _sp_issues.append((_sp_col, "Invalid"))
+            else:
+                _, _sp_vf = validate_field_value(_sp_col, _sp_v)
+                if _sp_vf or field_coherence(_sp_col, _sp_v) < 0.60:
+                    _sp_issues.append((_sp_col, "Verify"))
         h1,h2,h3,h4,h5 = st.columns([2,2.5,1.2,1.2,2.5])
         h1.markdown("**Field**")
         h2.markdown("**Value**")
         h3.markdown("**Confidence**")
         h4.markdown("**Status**")
-        h5.markdown("**Org Database Field**")
+        h5.markdown("**System Fields**")
         st.markdown("<hr style='margin:4px 0 8px 0;border-color:#e2e8f0;'>", unsafe_allow_html=True)
 
         edited_row = {}
         edited_org = {}
 
+        _ABBR_MAP = {
+            "M": "Male", "F": "Female",
+            "MALE": "Male", "FEMALE": "Female", "OTHER": "Other",
+            "NA": "N/A", "N/A": "N/A", "NONE": "",
+        }
         for col_name in cols_def:
             val  = row.get(col_name,"") or ""
-            base_conf = 0.9 if val else 0.0
-            penalty, val_flag = validate_field_value(col_name, val)
-            conf  = max(0.0, base_conf - penalty)
-            color = conf_color(conf)
+            _, val_flag = validate_field_value(col_name, val)
             is_dropdown = col_name in drops
             dropdown_options = get_dropdown_options(section, col_name) if is_dropdown else []
 
             fuzzy_val = val
+            val_pre   = val
             if is_dropdown and val and dropdown_options:
-                matched = fuzzy_match_dropdown(val, dropdown_options)
+                val_pre = _ABBR_MAP.get(val.strip().upper(), val)
+                matched = fuzzy_match_dropdown(val_pre, dropdown_options)
                 if matched:
                     fuzzy_val = matched
 
-            is_invalid = bool(val and is_dropdown and not check_dropdown_validity(section, col_name, fuzzy_val))
+            # Live confidence: read current widget value from session state
+            _sp_wkey = f"v_sp_{key}_{col_name}"
+            _sp_cur  = st.session_state.get(_sp_wkey, fuzzy_val)
+            if _sp_cur == "- Select -":
+                _sp_cur = ""
+            _, val_flag  = validate_field_value(col_name, _sp_cur if _sp_cur else val)
+            is_invalid = bool(_sp_cur and is_dropdown and not check_dropdown_validity(section, col_name, _sp_cur))
+
+            if not _sp_cur:
+                conf = 0.0
+            elif is_invalid:
+                conf = 0.0
+            elif is_dropdown:
+                conf = round(SequenceMatcher(None, val_pre.lower(), _sp_cur.lower()).ratio(), 2)
+            else:
+                conf = field_coherence(col_name, _sp_cur)
+
+            color = conf_color(conf)
 
             if is_invalid:
                 status_txt,status_cls = "Invalid","status-invalid"
@@ -1219,31 +1323,35 @@ def render_subpopup():
                 st.rerun()
 
 # ── MAIN POPUP (after upload) ─────────────────────────────────
-def approve_and_populate(result, is_vessel, pending_rows, pending_vessel, personal):
+def approve_and_populate(result, is_vessel, pending_rows, pending_vessel, personal, selected_sections=None):
     """
     Shared approval logic. Fills empty fields only - skips already populated ones.
-    Used by both the upload popup and the doc tank re-approve flow.
+    selected_sections: set of section names to populate. None = all sections.
     """
     if is_vessel:
-        if pending_vessel and any(v for v in pending_vessel.values()):
-            st.session_state["vessels"].append(pending_vessel)
+        if selected_sections is None or "Vessels" in selected_sections:
+            if pending_vessel and any(v for v in pending_vessel.values()):
+                st.session_state["vessels"].append(pending_vessel)
     else:
-        profile_data = personal_to_profile(personal)
-        for k, v in profile_data.items():
-            # Only fill if field is currently empty
-            if v and not st.session_state["profile"].get(k):
-                st.session_state["profile"][k] = v
+        if selected_sections is None or "Personal Information" in selected_sections:
+            profile_data = personal_to_profile(personal)
+            for k, v in profile_data.items():
+                # Only fill if field is currently empty
+                if v and not st.session_state["profile"].get(k):
+                    st.session_state["profile"][k] = v
 
-        for td in pending_rows.get("Travel Documents", []):
-            dt = (td.get("Document Type","") + td.get("Document Name","")).lower()
-            if "passport" in dt and td.get("Certificate Number"):
-                if not st.session_state["profile"].get("Passport Number"):
-                    st.session_state["profile"]["Passport Number"] = td["Certificate Number"]
-            if ("cdc" in dt or "seaman" in dt) and td.get("Certificate Number"):
-                if not st.session_state["profile"].get("CDC / Seaman's Book Number"):
-                    st.session_state["profile"]["CDC / Seaman's Book Number"] = td["Certificate Number"]
+            for td in pending_rows.get("Travel Documents", []):
+                dt = (td.get("Document Type","") + td.get("Document Name","")).lower()
+                if "passport" in dt and td.get("Certificate Number"):
+                    if not st.session_state["profile"].get("Passport Number"):
+                        st.session_state["profile"]["Passport Number"] = td["Certificate Number"]
+                if ("cdc" in dt or "seaman" in dt) and td.get("Certificate Number"):
+                    if not st.session_state["profile"].get("CDC / Seaman's Book Number"):
+                        st.session_state["profile"]["CDC / Seaman's Book Number"] = td["Certificate Number"]
 
         for section, rows in pending_rows.items():
+            if selected_sections is not None and section not in selected_sections:
+                continue
             for row in rows:
                 if any(v for v in row.values()):
                     st.session_state["sections"][section].append(row)
@@ -1252,24 +1360,74 @@ def render_popup():
     popup = st.session_state.get("popup")
     if not popup: return
 
-    result   = popup.get("result",{})
-    filename = popup.get("filename","document")
-    source   = popup.get("source","section")
+    result    = popup.get("result", {})
+    filename  = popup.get("filename", "document")
     is_vessel = result.get("is_vessel_document", False)
     is_resume = result.get("is_resume", False)
-    doc_type  = result.get("document_type","-")
-    personal  = result.get("personal",{})
-    missing   = result.get("missing_fields",[])
-    flags     = result.get("validation_flags",[])
+    doc_type  = result.get("document_type", "-")
+    personal  = result.get("personal", {})
+    missing   = result.get("missing_fields", [])
+    flags     = result.get("validation_flags", [])
 
-    # Build pending rows if not already built
+    # Build pending rows once; reset section nav on each new popup
     if "pending_rows" not in popup:
-        popup["pending_rows"] = result_to_rows(result)
-        popup["pending_vessel"] = vessel_result_to_row(result) if is_vessel else None
+        _draft_state = popup.get("draft_state")
+        if _draft_state:
+            popup["pending_rows"]   = _draft_state.get("pending_rows", result_to_rows(result))
+            popup["pending_vessel"] = _draft_state.get("pending_vessel", vessel_result_to_row(result) if is_vessel else None)
+            if _draft_state.get("personal"):
+                result["personal"] = _draft_state["personal"]
+        else:
+            popup["pending_rows"]   = result_to_rows(result)
+            popup["pending_vessel"] = vessel_result_to_row(result) if is_vessel else None
         st.session_state["popup"] = popup
+        st.session_state["popup_active_section"] = None
+        st.session_state["popup_discard_confirm"] = False
+        # Flush widget keys from any previous popup to prevent stale confidence scores
+        for _wk in list(st.session_state.keys()):
+            if _wk.startswith(("pp_popup_", "vc_popup_", "v_sp_")):
+                del st.session_state[_wk]
+        # Initialise section selections - all True by default
+        _init_sel = {}
+        if is_vessel:
+            _init_sel["Vessels"] = True
+        else:
+            if any(v for v in personal.values()):
+                _init_sel["Personal Information"] = True
+            for _sn, _srows in popup["pending_rows"].items():
+                if _srows:
+                    _init_sel[_sn] = True
+        st.session_state["popup_section_selections"] = _init_sel
 
     pending_rows   = popup["pending_rows"]
     pending_vessel = popup.get("pending_vessel")
+    _dt_approved   = (popup.get("source") == "doc_tank" and popup.get("tank_status", "") in ("Approved", "Partial"))
+
+    # Count low-confidence fields in one section row
+    def _row_low_conf(section_name, row):
+        drops = DROPDOWN_FIELDS.get(section_name, {})
+        count = 0
+        for col_name, val in row.items():
+            if not val:
+                continue
+            penalty, _ = validate_field_value(col_name, val)
+            conf = max(0.0, 0.9 - penalty)
+            if col_name in drops and not check_dropdown_validity(section_name, col_name, val):
+                conf = 0.0
+            if conf < 0.90:
+                count += 1
+        return count
+
+    # Count personal fields that fail format validation
+    def _personal_low_conf():
+        count = 0
+        for k, v in personal.items():
+            if not v:
+                continue
+            penalty, _ = validate_field_value(k, v)
+            if penalty > 0:
+                count += 1
+        return count
 
     with st.expander(f"Review & Approve - {filename}", expanded=True):
 
@@ -1277,209 +1435,521 @@ def render_popup():
         if popup.get("source") == "doc_tank":
             tank_status = popup.get("tank_status", "Pending")
             if tank_status == "Approved":
-                st.success(f"This document was previously approved. Re-approving will only fill currently empty fields.")
+                st.info("This document was already approved. To update, re-upload the document.")
             else:
                 st.warning("This document is pending approval. Review and approve below.")
 
-        m1,m2,m3 = st.columns(3)
+        m1, m2, m3 = st.columns(3)
         m1.metric("Document Type", doc_type)
         m2.metric("Vessel Document", "Yes" if is_vessel else "No")
         m3.metric("CV / Resume", "Yes" if is_resume else "No")
 
-        if is_vessel and pending_vessel:
-            st.info(f"Vessel certificate detected - will populate **Vessels** section.")
-        else:
-            total_rows = sum(len(r) for r in pending_rows.values())
-            pers_count = len([v for v in personal.values() if v])
-            st.info(f"Personal fields: {pers_count}  |  Section records: {total_rows}")
-
         st.markdown("---")
 
-        # Personal info - show if not vessel doc AND personal data was found
-        # For sectional uploads, this surfaces adjacent fields (name, DOB etc) for user approval
-        target_sec = popup.get("target_section", "")
-        is_sectional = popup.get("source") == "section"
-        show_personal = (not is_vessel) and any(v for v in personal.values())
-        if is_sectional and show_personal:
-            st.info("ℹ️ Personal info found in this document - review below before approving.")
-        if show_personal:
-            st.markdown('<div class="section-label">Personal Information</div>', unsafe_allow_html=True)
-            p_items = [(k,v) for k,v in personal.items() if v]
-            for i in range(0,len(p_items),3):
-                row = p_items[i:i+3]
-                cols = st.columns(3)
-                for j,(k,v) in enumerate(row):
-                    with cols[j]:
-                        st.markdown(f'<div class="field-label">{k.replace("_"," ").title()}</div>', unsafe_allow_html=True)
-                        personal[k] = st.text_input(f"pp_{k}", value=v, key=f"pp_popup_{k}", label_visibility="collapsed")
-
-        # Vessel certificate preview
+        # ── VESSEL FLOW: inline editable confidence table ─────
         if is_vessel and pending_vessel:
+            if not _dt_approved:
+                _vsl_chk = st.checkbox(
+                    "Include in Approve and Populate",
+                    value=st.session_state.get("popup_section_selections", {}).get("Vessels", True),
+                    key="ov_chk_vessel"
+                )
+                st.session_state.setdefault("popup_section_selections", {})["Vessels"] = _vsl_chk
+            st.info("Vessel certificate detected - will populate the **Vessels** section.")
             st.markdown('<div class="section-label">Vessel Certificate</div>', unsafe_allow_html=True)
-            vc_items = [(k,v) for k,v in pending_vessel.items() if v]
-            for vi in range(0, len(vc_items), 3):
-                chunk = vc_items[vi:vi+3]
-                vcols = st.columns(3)
-                for vj,(vk,vv) in enumerate(chunk):
-                    with vcols[vj]:
-                        st.markdown(f'<div class="field-label">{vk.replace("_"," ").title()}</div>', unsafe_allow_html=True)
-                        st.markdown(f'<div class="field-value">{vv or "-"}</div>', unsafe_allow_html=True)
+            _vsl_drops = DROPDOWN_FIELDS.get("Vessels", {})
+            vh1, vh2, vh3, vh4, vh5 = st.columns([2, 2.5, 1.2, 1.2, 2.5])
+            vh1.markdown("**Field**")
+            vh2.markdown("**Value**")
+            vh3.markdown("**Confidence**")
+            vh4.markdown("**Status**")
+            vh5.markdown("**System Fields**")
+            st.markdown("<hr style='margin:4px 0 8px 0;border-color:#e2e8f0;'>", unsafe_allow_html=True)
+            for _vc_col in VESSEL_COLUMNS:
+                _vc_val = pending_vessel.get(_vc_col, "") or ""
+                _, _vc_flag = validate_field_value(_vc_col, _vc_val)
+                _vc_drop_opts = _vsl_drops.get(_vc_col, [])
+                _vc_is_drop   = bool(_vc_drop_opts)
+                _vc_matched   = _vc_val
+                if _vc_is_drop and _vc_val:
+                    _vc_pm = fuzzy_match_dropdown(_vc_val, _vc_drop_opts)
+                    if _vc_pm:
+                        _vc_matched = _vc_pm
+                # Live confidence: read current widget value from session state
+                _vc_wkey = f"vc_popup_{_vc_col}"
+                _vc_cur  = st.session_state.get(_vc_wkey, _vc_matched)
+                if _vc_cur == "- Select -":
+                    _vc_cur = ""
+                _, _vc_flag = validate_field_value(_vc_col, _vc_cur if _vc_cur else _vc_val)
+                _vc_invalid = bool(_vc_cur and _vc_is_drop and not check_dropdown_validity("Vessels", _vc_col, _vc_cur))
+                if not _vc_cur:
+                    _vc_conf = 0.0
+                elif _vc_invalid:
+                    _vc_conf = 0.0
+                elif _vc_is_drop:
+                    _vc_conf = round(SequenceMatcher(None, _vc_val.lower(), _vc_cur.lower()).ratio(), 2)
+                else:
+                    _vc_conf = field_coherence(_vc_col, _vc_cur)
+                _vc_color = conf_color(_vc_conf)
+                if _vc_invalid:
+                    _vc_status_txt, _vc_status_cls = "Invalid",      "status-invalid"
+                elif _vc_flag:
+                    _vc_status_txt, _vc_status_cls = "Verify",       "status-verify"
+                elif _vc_conf >= 0.90:
+                    _vc_status_txt, _vc_status_cls = "Matched",      "status-matched"
+                elif _vc_conf > 0.0:
+                    _vc_status_txt, _vc_status_cls = "Verify",       "status-verify"
+                else:
+                    _vc_status_txt, _vc_status_cls = "Manual Entry", "status-manual"
+                vc1, vc2, vc3, vc4, vc5 = st.columns([2, 2.5, 1.2, 1.2, 2.5])
+                with vc1:
+                    st.markdown(
+                        f'<div style="font-size:0.82rem;color:#1e293b;font-weight:500;padding-top:6px;">{_vc_col}</div>'
+                        f'<div style="font-size:0.68rem;color:#94a3b8;font-style:italic;">Extracted: {_vc_val if _vc_val else "-"}</div>',
+                        unsafe_allow_html=True
+                    )
+                    if _vc_invalid:
+                        st.markdown('<span class="invalid-flag">Not in dropdown</span>', unsafe_allow_html=True)
+                    if _vc_flag:
+                        st.markdown('<span class="invalid-flag">Format issue</span>', unsafe_allow_html=True)
+                with vc2:
+                    if _vc_is_drop and not _dt_approved:
+                        _vc_opts = ["- Select -"] + _vc_drop_opts
+                        _vc_idx  = next((i+1 for i, o in enumerate(_vc_drop_opts) if o.casefold() == _vc_matched.casefold()), 0)
+                        _vc_sel  = st.selectbox(f"vc_{_vc_col}", options=_vc_opts, index=_vc_idx,
+                                                key=f"vc_popup_{_vc_col}", label_visibility="collapsed")
+                        pending_vessel[_vc_col] = "" if _vc_sel == "- Select -" else _vc_sel
+                    elif not _dt_approved:
+                        pending_vessel[_vc_col] = st.text_input(
+                            f"vc_{_vc_col}", value=_vc_matched,
+                            key=f"vc_popup_{_vc_col}", label_visibility="collapsed"
+                        )
+                    else:
+                        st.markdown(
+                            f'<div style="padding-top:6px;font-size:0.85rem;color:#1e293b;">{_vc_val or "-"}</div>',
+                            unsafe_allow_html=True
+                        )
+                with vc3:
+                    st.markdown(
+                        f'<div style="padding-top:6px;">'
+                        f'<div style="background:#f1f5f9;border-radius:4px;height:6px;width:70px;">'
+                        f'<div style="width:{int(_vc_conf*100)}%;height:6px;background:{_vc_color};border-radius:4px;"></div></div>'
+                        f'<div style="font-size:0.65rem;color:{_vc_color};margin-top:2px;">{int(_vc_conf*100)}%</div></div>',
+                        unsafe_allow_html=True
+                    )
+                with vc4:
+                    st.markdown(
+                        f'<div style="padding-top:8px;"><span class="{_vc_status_cls}">{_vc_status_txt}</span></div>',
+                        unsafe_allow_html=True
+                    )
+                with vc5:
+                    _vc_org_default = ORG_PREMAP.get(_vc_col, "Other / Unclassified")
+                    _vc_org_opts = ["- Select org field -"] + ALL_ORG_OPTIONS
+                    _vc_org_idx  = next((i+1 for i,o in enumerate(ALL_ORG_OPTIONS) if o == _vc_org_default), 0)
+                    st.selectbox(f"o_vc_{_vc_col}", options=_vc_org_opts, index=_vc_org_idx,
+                                 key=f"o_vc_popup_{_vc_col}", label_visibility="collapsed")
 
-            if st.button("Edit Vessel Certificate", key="popup_vessel_edit_all", use_container_width=False):
-                st.session_state["subpopup"] = {
-                    "section": "Vessels", "row_idx": 0,
-                    "row": copy.deepcopy(pending_vessel),
-                    "key": "popup_vessel", "source": "popup"
-                }
-                st.rerun()
-
-        # Section grids
+        # ── CREW FLOW: section card overview + drill-in ───────
         if not is_vessel:
-            for section_name, rows in pending_rows.items():
-                if not rows: continue
-                st.markdown(f'<div class="section-label">{section_name} - {len(rows)} record(s)</div>', unsafe_allow_html=True)
-                for ridx, row in enumerate(rows):
-                    title_val = next((row[f] for f in ["Document Name","Company","Institution Name","Bank Name","Vessel Name"] if row.get(f)), f"Record {ridx+1}")
-                    drops = DROPDOWN_FIELDS.get(section_name,{})
-                    invalid_fields = [cn for cn,val in row.items() if val and cn in drops and not check_dropdown_validity(section_name,cn,val)]
+            active_sec = st.session_state.get("popup_active_section")
 
-                    cc1,cc2 = st.columns([4,1])
-                    with cc1:
-                        badge = f' <span class="invalid-flag">⚠ {len(invalid_fields)} invalid field(s)</span>' if invalid_fields else ""
-                        st.markdown(f'<div class="grid-card"><div class="grid-card-title">{title_val}{badge}</div></div>', unsafe_allow_html=True)
-                    with cc2:
-                        if st.button("Edit", key=f"popup_edit_{section_name}_{ridx}", use_container_width=True):
-                            st.session_state["subpopup"] = {
-                                "section":section_name,"row_idx":ridx,
-                                "row":copy.deepcopy(row),"key":f"popup_{section_name}_{ridx}",
-                                "source":"popup"
-                            }
+            # ── OVERVIEW: one card per section that has data ──
+            if active_sec is None:
+                _sel_state = st.session_state.get("popup_section_selections", {})
+                show_personal = any(v for v in personal.values())
+                if show_personal:
+                    p_low   = _personal_low_conf()
+                    p_total = len([v for v in personal.values() if v])
+                    p_badge = (
+                        f'<span class="status-verify">{p_low} to verify</span>'
+                        if p_low else
+                        '<span class="status-matched">All matched</span>'
+                    )
+                    ov_chk, ov1, ov2 = st.columns([0.5, 3.5, 1])
+                    with ov_chk:
+                        if not _dt_approved:
+                            st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+                            _pi_chk = st.checkbox("", value=_sel_state.get("Personal Information", True),
+                                                  key="ov_chk_personal", label_visibility="collapsed")
+                            st.session_state.setdefault("popup_section_selections", {})["Personal Information"] = _pi_chk
+                    with ov1:
+                        st.markdown(
+                            f'<div class="grid-card">'
+                            f'<div class="grid-card-title">Personal Information</div>'
+                            f'<div class="grid-card-sub">{p_total} field(s) extracted &nbsp;|&nbsp; {p_badge}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    with ov2:
+                        if st.button("Review", key="popup_open_personal", use_container_width=True):
+                            st.session_state["popup_active_section"] = "Personal Information"
                             st.rerun()
+
+                for section_name, rows in pending_rows.items():
+                    if not rows:
+                        continue
+                    total_low = sum(_row_low_conf(section_name, row) for row in rows)
+                    s_badge = (
+                        f'<span class="status-verify">{total_low} to verify</span>'
+                        if total_low else
+                        '<span class="status-matched">All matched</span>'
+                    )
+                    ov_chk, ov1, ov2 = st.columns([0.5, 3.5, 1])
+                    with ov_chk:
+                        if not _dt_approved:
+                            st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+                            _sec_chk = st.checkbox("", value=_sel_state.get(section_name, True),
+                                                   key=f"ov_chk_{section_name}", label_visibility="collapsed")
+                            st.session_state.setdefault("popup_section_selections", {})[section_name] = _sec_chk
+                    with ov1:
+                        st.markdown(
+                            f'<div class="grid-card">'
+                            f'<div class="grid-card-title">{section_name}</div>'
+                            f'<div class="grid-card-sub">{len(rows)} record(s) &nbsp;|&nbsp; {s_badge}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    with ov2:
+                        if st.button("Review", key=f"popup_open_{section_name}", use_container_width=True):
+                            st.session_state["popup_active_section"] = section_name
+                            st.rerun()
+
+            # ── PERSONAL INFO DRILL-IN ────────────────────────
+            elif active_sec == "Personal Information":
+                if st.button("< Back", key="popup_back_personal"):
+                    st.session_state["popup_active_section"] = None
+                    st.rerun()
+                st.markdown('<div class="section-label">Personal Information</div>', unsafe_allow_html=True)
+                if popup.get("source") == "section":
+                    st.info("Personal info found in this document - review below before approving.")
+                if _dt_approved:
+                    # Read-only display for approved documents
+                    _PK_RO = {"person_name": "full_name", "rank": "current_rank"}
+                    _ro_items = [(fl, personal.get(_PK_RO.get(fk, fk), "") or "") for fk, fl in PERSONAL_FIELDS]
+                    _filled = [(fl, v) for fl, v in _ro_items if v]
+                    st.caption(f"{len(_filled)} of {len(PERSONAL_FIELDS)} fields extracted")
+                    for i in range(0, len(_ro_items), 3):
+                        grp = _ro_items[i:i+3]
+                        ro_cols = st.columns(3)
+                        for j, (fl, v) in enumerate(grp):
+                            with ro_cols[j]:
+                                st.markdown(f'<div class="field-label">{fl}</div>', unsafe_allow_html=True)
+                                if v:
+                                    st.markdown(f'<div class="field-value">{v}</div>', unsafe_allow_html=True)
+                                else:
+                                    st.markdown(f'<div class="field-empty">-</div>', unsafe_allow_html=True)
+                else:
+                    # Confidence table header
+                    ph1, ph2, ph3, ph4, ph5 = st.columns([2, 2.5, 1.2, 1.2, 2.5])
+                    ph1.markdown("**Field**")
+                    ph2.markdown("**Value**")
+                    ph3.markdown("**Confidence**")
+                    ph4.markdown("**Status**")
+                    ph5.markdown("**System Fields**")
+                    st.markdown("<hr style='margin:4px 0 8px 0;border-color:#e2e8f0;'>", unsafe_allow_html=True)
+                    # LLM returns these under different keys than PERSONAL_FIELDS fk
+                    _P_KEY   = {"person_name": "full_name", "rank": "current_rank"}
+                    _p_drops = DROPDOWN_FIELDS.get("Personal Information", {})
+                    _P_ABBR_MAP = {
+                        "M": "Male", "F": "Female",
+                        "MALE": "Male", "FEMALE": "Female", "OTHER": "Other",
+                        "NA": "N/A", "N/A": "N/A", "NONE": "",
+                    }
+                    for fk, fl in PERSONAL_FIELDS:
+                        _pk  = _P_KEY.get(fk, fk)
+                        val  = personal.get(_pk, "") or ""
+                        _p_drop_opts = _p_drops.get(fl, [])
+                        _is_p_drop   = bool(_p_drop_opts)
+                        _p_val_pre   = val
+                        _p_matched   = val
+                        if _is_p_drop and val:
+                            _p_val_pre = _P_ABBR_MAP.get(val.strip().upper(), val)
+                            _pm = fuzzy_match_dropdown(_p_val_pre, _p_drop_opts)
+                            if _pm:
+                                _p_matched = _pm
+                        # Live confidence: read current widget value from session state
+                        _pp_wkey = f"pp_popup_{_pk}"
+                        _pp_cur  = st.session_state.get(_pp_wkey, _p_matched)
+                        if _pp_cur == "- Select -":
+                            _pp_cur = ""
+                        _, val_flag = validate_field_value(fl, _pp_cur if _pp_cur else val)
+                        _is_p_invalid = bool(_pp_cur and _is_p_drop and not check_dropdown_validity("Personal Information", fl, _pp_cur))
+
+                        if not _pp_cur:
+                            conf = 0.0
+                        elif _is_p_invalid:
+                            conf = 0.0
+                        elif _is_p_drop:
+                            conf = round(SequenceMatcher(None, _p_val_pre.lower(), _pp_cur.lower()).ratio(), 2)
+                        else:
+                            conf = field_coherence(fl, _pp_cur)
+
+                        color = conf_color(conf)
+
+                        if _is_p_invalid:
+                            status_txt, status_cls = "Invalid",      "status-invalid"
+                        elif val_flag:
+                            status_txt, status_cls = "Verify",       "status-verify"
+                        elif conf >= 0.90:
+                            status_txt, status_cls = "Matched",      "status-matched"
+                        elif conf > 0.0:
+                            status_txt, status_cls = "Verify",       "status-verify"
+                        else:
+                            status_txt, status_cls = "Manual Entry", "status-manual"
+
+                        pc1, pc2, pc3, pc4, pc5 = st.columns([2, 2.5, 1.2, 1.2, 2.5])
+                        with pc1:
+                            st.markdown(
+                                f'<div style="font-size:0.82rem;color:#1e293b;font-weight:500;padding-top:6px;">{fl}</div>'
+                                f'<div style="font-size:0.68rem;color:#94a3b8;font-style:italic;">Extracted: {val if val else "-"}</div>',
+                                unsafe_allow_html=True
+                            )
+                            if _is_p_invalid:
+                                st.markdown('<span class="invalid-flag">Not in dropdown</span>', unsafe_allow_html=True)
+                            if val_flag:
+                                st.markdown('<span class="invalid-flag">Format issue</span>', unsafe_allow_html=True)
+                        with pc2:
+                            if _is_p_drop:
+                                _p_opts = ["- Select -"] + _p_drop_opts
+                                _p_idx  = next((i+1 for i, o in enumerate(_p_drop_opts) if o.casefold() == _p_matched.casefold()), 0)
+                                _sel = st.selectbox(f"pp_{_pk}", options=_p_opts, index=_p_idx,
+                                                    key=f"pp_popup_{_pk}", label_visibility="collapsed")
+                                personal[_pk] = "" if _sel == "- Select -" else _sel
+                            else:
+                                personal[_pk] = st.text_input(
+                                    f"pp_{_pk}", value=val, key=f"pp_popup_{_pk}", label_visibility="collapsed"
+                                )
+                        with pc3:
+                            st.markdown(
+                                f'<div style="padding-top:6px;">'
+                                f'<div style="background:#f1f5f9;border-radius:4px;height:6px;width:70px;">'
+                                f'<div style="width:{int(conf*100)}%;height:6px;background:{color};border-radius:4px;"></div></div>'
+                                f'<div style="font-size:0.65rem;color:{color};margin-top:2px;">{int(conf*100)}%</div></div>',
+                                unsafe_allow_html=True
+                            )
+                        with pc4:
+                            st.markdown(
+                                f'<div style="padding-top:8px;"><span class="{status_cls}">{status_txt}</span></div>',
+                                unsafe_allow_html=True
+                            )
+                        with pc5:
+                            _pp_org_default = ORG_PREMAP.get(fl, "Other / Unclassified")
+                            _pp_org_opts = ["- Select org field -"] + ALL_ORG_OPTIONS
+                            _pp_org_idx  = next((i+1 for i,o in enumerate(ALL_ORG_OPTIONS) if o == _pp_org_default), 0)
+                            st.selectbox(f"o_pp_{_pk}", options=_pp_org_opts, index=_pp_org_idx,
+                                         key=f"o_pp_popup_{_pk}", label_visibility="collapsed")
+
+            # ── SECTION RECORDS DRILL-IN (table view) ────────────
+            else:
+                rows     = pending_rows.get(active_sec, [])
+                cols_def = SECTION_COLUMNS.get(active_sec, VESSEL_COLUMNS)
+                if st.button("< Back", key=f"popup_back_{active_sec}"):
+                    st.session_state["popup_active_section"] = None
+                    st.rerun()
+                st.markdown(f'<div class="section-label">{active_sec} - {len(rows)} record(s)</div>', unsafe_allow_html=True)
+                if rows:
+                    df = pd.DataFrame(rows)
+                    for c in cols_def:
+                        if c not in df.columns:
+                            df[c] = ""
+                    df = df[cols_def].fillna("")
+                    if _dt_approved:
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                    else:
+                        t_col, e_col = st.columns([6, 1])
+                        with t_col:
+                            st.dataframe(df, use_container_width=True, hide_index=True)
+                        with e_col:
+                            st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
+                            for ridx, row in enumerate(rows):
+                                if st.button("Edit", key=f"popup_edit_{active_sec}_{ridx}", use_container_width=True):
+                                    st.session_state["subpopup"] = {
+                                        "section":  active_sec,
+                                        "row_idx":  ridx,
+                                        "row":      copy.deepcopy(row),
+                                        "key":      f"popup_{active_sec}_{ridx}",
+                                        "source":   "popup"
+                                    }
+                                    st.rerun()
+                                st.markdown("<div style='height:21px'></div>", unsafe_allow_html=True)
 
         if flags:
             st.markdown("---")
-            for f in flags: st.warning(f)
+            for f in flags:
+                st.warning(f)
         if missing:
-            st.markdown(" ".join(f'<span class="missing-tag">{m}</span>' for m in missing), unsafe_allow_html=True)
+            st.markdown(
+                " ".join(f'<span class="missing-tag">{m}</span>' for m in missing),
+                unsafe_allow_html=True
+            )
 
         st.markdown("---")
-        ba,bb,bc = st.columns([2,2,1])
+        ba, bb, bc, bd = st.columns([2, 1, 1, 1])
         with ba:
-            # Label changes based on source and prior approval status
-            tank_status = popup.get("tank_status", "Pending")
-            is_dt_source = popup.get("source") == "doc_tank"
-            btn_approve_label = "Re-Approve (fill empty only)" if (is_dt_source and tank_status == "Approved") else "Approve and Populate"
+            tank_status       = popup.get("tank_status", "Pending")
+            is_dt_source      = popup.get("source") == "doc_tank"
+            _already_approved = is_dt_source and tank_status in ("Approved", "Partial")
+            _confirming       = st.session_state.get("popup_confirm_approve", False)
+            _in_drill         = not is_vessel and st.session_state.get("popup_active_section") is not None
+            if _in_drill:
+                if st.button("Save Changes", use_container_width=True, key="save_changes_popup"):
+                    st.session_state["popup_active_section"] = None
+                    st.session_state["popup_confirm_approve"] = False
+                    st.rerun()
+            elif not _confirming:
+                if st.button("Approve and Populate", type="primary", use_container_width=True,
+                             key="approve_popup", disabled=_already_approved):
+                    st.session_state["popup_confirm_approve"] = True
+                    st.rerun()
+            else:
+                st.warning("Populate profile with selected sections?")
+                _conf1, _conf2 = st.columns(2)
+                with _conf1:
+                    if st.button("Yes, Approve", type="primary", use_container_width=True, key="approve_confirm_yes"):
+                        _selections   = st.session_state.get("popup_section_selections", {})
+                        _selected_set = set(k for k, v in _selections.items() if v)
 
-            if st.button(btn_approve_label, type="primary", use_container_width=True, key="approve_popup"):
-                approve_and_populate(result, is_vessel, pending_rows, pending_vessel, personal)
+                        # Resume wipe clears both profile and all crew sections
+                        if result.get("is_resume", False) and not is_vessel:
+                            st.session_state["profile"] = {}
+                            for _wipe_sec in SECTION_COLUMNS:
+                                st.session_state["sections"][_wipe_sec] = []
 
-                # Build approved fields list for doc tank display
-                approved_fields = []
-                if not is_vessel:
-                    approved_fields += [v for v in personal.values() if v]
-                    for sec_rows in pending_rows.values():
-                        for row in sec_rows:
-                            for k, v in row.items():
-                                if v:
-                                    approved_fields.append(f"{k}: {v[:30]}")
-                if is_vessel and pending_vessel:
-                    approved_fields += [f"{k}: {v[:30]}" for k,v in pending_vessel.items() if v]
+                        approve_and_populate(result, is_vessel, pending_rows, pending_vessel, personal,
+                                             selected_sections=_selected_set if _selected_set else None)
 
-                # Mark the doc tank entry as approved + store approved fields
-                tank_id = popup.get("tank_id")
-                for dt_entry in st.session_state["doc_tank"]:
-                    if dt_entry.get("tank_id") == tank_id:
-                        dt_entry["status"] = "Approved"
-                        dt_entry["approved_fields"] = approved_fields
-                        break
+                        # Build approved fields list (only from selected sections)
+                        approved_fields = []
+                        if not is_vessel:
+                            if _selections.get("Personal Information", True):
+                                approved_fields += [v for v in personal.values() if v]
+                            for sec_name, sec_rows in pending_rows.items():
+                                if _selections.get(sec_name, True):
+                                    for row in sec_rows:
+                                        for k, v in row.items():
+                                            if v:
+                                                approved_fields.append(f"{k}: {v[:30]}")
+                        if is_vessel and pending_vessel:
+                            if _selections.get("Vessels", True):
+                                approved_fields += [f"{k}: {v[:30]}" for k, v in pending_vessel.items() if v]
 
-                st.session_state["popup"] = None
-                st.success("Profile populated successfully.")
-                st.rerun()
+                        # Determine Approved vs Partial
+                        _all_available = set()
+                        if is_vessel:
+                            _all_available.add("Vessels")
+                        else:
+                            if any(v for v in personal.values()):
+                                _all_available.add("Personal Information")
+                            for _sn, _srows in pending_rows.items():
+                                if _srows:
+                                    _all_available.add(_sn)
+                        _final_status = "Approved" if _selected_set >= _all_available else "Partial"
+
+                        # Mark the doc tank entry
+                        tank_id = popup.get("tank_id")
+                        for dt_entry in st.session_state["doc_tank"]:
+                            if dt_entry.get("tank_id") == tank_id:
+                                dt_entry["status"] = _final_status
+                                dt_entry["approved_fields"] = approved_fields
+                                break
+
+                        st.session_state["popup_confirm_approve"] = False
+                        st.session_state["popup_discard_confirm"] = False
+                        st.session_state["popup"] = None
+                        st.session_state["popup_active_section"] = None
+                        st.success("Profile populated successfully.")
+                        st.rerun()
+                with _conf2:
+                    if st.button("Cancel", use_container_width=True, key="approve_confirm_cancel"):
+                        st.session_state["popup_confirm_approve"] = False
+                        st.rerun()
 
         with bb:
-            st.download_button("Download Raw JSON", data=json.dumps(result,indent=2),
+            st.download_button(
+                "Download Raw JSON", data=json.dumps(result, indent=2),
                 file_name=f"{Path(filename).stem}_raw.json",
-                mime="application/json", key="dl_popup", use_container_width=True)
+                mime="application/json", key="dl_popup", use_container_width=True
+            )
         with bc:
+            if not _already_approved:
+                if st.button("Save as Draft", use_container_width=True, key="save_draft_popup"):
+                    _draft_personal = dict(result.get("personal", {}))
+                    _draft_state = {
+                        "pending_rows":   copy.deepcopy(pending_rows),
+                        "pending_vessel": copy.deepcopy(pending_vessel) if pending_vessel else None,
+                        "personal":       _draft_personal,
+                    }
+                    tank_id = popup.get("tank_id")
+                    for dt_entry in st.session_state["doc_tank"]:
+                        if dt_entry.get("tank_id") == tank_id:
+                            dt_entry["status"]      = "Draft"
+                            dt_entry["draft_state"] = _draft_state
+                            break
+                    st.session_state["popup"] = None
+                    st.session_state["popup_active_section"] = None
+                    st.session_state["popup_confirm_approve"] = False
+                    st.session_state["popup_discard_confirm"] = False
+                    st.rerun()
+        with bd:
             discard_label = "Close" if popup.get("source") == "doc_tank" else "Discard"
-            if st.button(discard_label, use_container_width=True, key="discard_popup"):
-                st.session_state["popup"] = None
-                st.rerun()
+            if _already_approved:
+                if st.button(discard_label, use_container_width=True, key="discard_popup"):
+                    st.session_state["popup"] = None
+                    st.session_state["popup_active_section"] = None
+                    st.session_state["popup_confirm_approve"] = False
+                    st.session_state["popup_discard_confirm"] = False
+                    st.rerun()
+            elif st.session_state.get("popup_discard_confirm"):
+                st.markdown(
+                    '<div style="font-size:0.72rem;color:#f59e0b;font-weight:600;margin-bottom:4px;text-align:center;">Save as Draft?</div>',
+                    unsafe_allow_html=True
+                )
+                _dc1, _dc2 = st.columns(2)
+                with _dc1:
+                    if st.button("Save Draft", use_container_width=True, key="discard_save_draft"):
+                        _d_draft_state = {
+                            "pending_rows":   copy.deepcopy(pending_rows),
+                            "pending_vessel": copy.deepcopy(pending_vessel) if pending_vessel else None,
+                            "personal":       dict(result.get("personal", {})),
+                        }
+                        _d_tank_id = popup.get("tank_id")
+                        for _d_entry in st.session_state["doc_tank"]:
+                            if _d_entry.get("tank_id") == _d_tank_id:
+                                _d_entry["status"]      = "Draft"
+                                _d_entry["draft_state"] = _d_draft_state
+                                break
+                        st.session_state["popup"] = None
+                        st.session_state["popup_active_section"] = None
+                        st.session_state["popup_confirm_approve"] = False
+                        st.session_state["popup_discard_confirm"] = False
+                        st.rerun()
+                with _dc2:
+                    if st.button("Discard", use_container_width=True, key="discard_confirm_close"):
+                        st.session_state["popup"] = None
+                        st.session_state["popup_active_section"] = None
+                        st.session_state["popup_confirm_approve"] = False
+                        st.session_state["popup_discard_confirm"] = False
+                        st.rerun()
+            else:
+                if st.button(discard_label, use_container_width=True, key="discard_popup"):
+                    st.session_state["popup_discard_confirm"] = True
+                    st.rerun()
 
 # ── HEADER ────────────────────────────────────────────────────
-col_brand,col_master = st.columns([3,1])
-with col_brand:
-    st.markdown("""
-    <div style="background:linear-gradient(135deg,#0f172a,#1e3a5f);border-radius:12px;padding:16px 24px;margin-bottom:16px;">
-        <div style="font-size:1.3rem;font-weight:700;color:#38bdf8;">SeaBotics.ai</div>
-        <div style="font-size:0.72rem;color:#94a3b8;margin-top:2px;">Crew & Vessel Profile Management - v5.0</div>
-    </div>""", unsafe_allow_html=True)
-
-with col_master:
-    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-    st.markdown("**Master Upload**")
-    st.caption("Docs, merged PDFs, CVs, or Vessel Certs")
-    master_file = st.file_uploader("master", type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
-                                   label_visibility="collapsed", key="master_uploader")
-    if master_file and st.button("Run Pipeline", use_container_width=True, key="run_master"):
-        with st.spinner("Classifying document..."):
-            ext = Path(master_file.name).suffix.lower()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                tmp.write(master_file.read()); tmp_path = tmp.name
-            try:
-                text = extract_text(tmp_path)
-
-                # Call 1 - lightweight classify
-                clf = classify_document(text)
-                if not clf:
-                    st.error("Classification failed."); st.stop()
-
-                is_vessel  = clf.get("is_vessel", False)
-                is_resume  = clf.get("is_resume", False)
-                target_sec = clf.get("target_section", "")
-                doc_type   = clf.get("doc_type", "")
-
-                # Call 2 - targeted extraction
-                with st.spinner(f"Extracting: {doc_type or target_sec}..."):
-                    result = call_llm(text,
-                                      target_section=target_sec,
-                                      is_vessel=is_vessel,
-                                      is_resume=is_resume)
-
-                if result:
-                    # Stamp doc_type from classifier if LLM didn't fill it
-                    if not result.get("document_type") and doc_type:
-                        result["document_type"] = doc_type
-                    result["is_vessel_document"] = is_vessel
-                    result["is_resume"] = is_resume
-                    save_to_doc_tank(result, master_file.name, "master",
-                                     result.get("document_type", doc_type),
-                                     is_vessel, is_resume)
-                    st.session_state["popup"] = {
-                        "key": "master", "result": result,
-                        "filename": master_file.name, "source": "master",
-                        "target_section": target_sec,
-                        "tank_id": st.session_state["doc_tank"][-1]["tank_id"]
-                    }
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Error: {e}")
+st.markdown("""
+<div style="background:linear-gradient(135deg,#0f172a,#1e3a5f);border-radius:12px;padding:16px 24px;margin-bottom:16px;">
+    <div style="font-size:1.3rem;font-weight:700;color:#38bdf8;">SeaBotics.ai</div>
+    <div style="font-size:0.72rem;color:#94a3b8;margin-top:2px;">Crew & Vessel Profile Management - v5.0</div>
+</div>""", unsafe_allow_html=True)
 
 # ── NAV ───────────────────────────────────────────────────────
-n1,n2,n3,n4 = st.columns([1,1,1,5])
-with n1:
-    if st.button("My Profile", use_container_width=True,
-                 type="primary" if st.session_state["page"]=="My Profile" else "secondary"):
-        st.session_state["page"]="My Profile"; st.rerun()
-with n2:
-    if st.button("Vessels", use_container_width=True,
-                 type="primary" if st.session_state["page"]=="Vessels" else "secondary"):
-        st.session_state["page"]="Vessels"; st.rerun()
-with n3:
-    if st.button("Doc Tank", use_container_width=True,
-                 type="primary" if st.session_state["page"]=="Doc Tank" else "secondary"):
-        st.session_state["page"]="Doc Tank"; st.rerun()
+_n1, _n2, _n3, _ = st.columns([1, 1, 1, 5])
+for _ncol, _label, _key in [(_n1, "Crew", "Crew"), (_n2, "Vessel", "Vessel"), (_n3, "Doc Tank", "Doc Tank")]:
+    with _ncol:
+        _btn_type = "primary" if st.session_state["page"] == _key else "secondary"
+        if st.button(_label, use_container_width=True, type=_btn_type, key=f"nav_{_key}"):
+            st.session_state["page"] = _key
+            st.rerun()
 
 # ── SUBPOPUP (always rendered on top if active) ───────────────
 if st.session_state.get("subpopup"):
@@ -1492,34 +1962,53 @@ elif st.session_state.get("popup"):
 # ════════════════════════════════════════════════════════════
 #  MY PROFILE
 # ════════════════════════════════════════════════════════════
-elif st.session_state["page"] == "My Profile":
+elif st.session_state["page"] == "Crew":
 
-    # Personal Info
-    with st.expander("Personal Information", expanded=True):
-        uc1,uc2 = st.columns([4,1])
-        with uc1:
-            sec_file=st.file_uploader("Upload personal doc",type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
-                                      key="up_personal",label_visibility="collapsed")
-        with uc2:
+    # All Crew tabs
+    _crew_tabs = st.tabs([
+        "Personal Info", "Experience", "Licenses and Certifications",
+        "Medical", "Education", "Courses", "Bank Details",
+        "Travel Documents", "Doc Check-List", "Travel Details",
+    ])
+
+    # Personal Info tab
+    with _crew_tabs[0]:
+        st.markdown(
+            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
+            '<span style="font-size:1.1rem;">✨</span>'
+            '<span style="font-size:0.9rem;font-weight:700;color:#0f172a;">AI-Assisted Profile Fill</span>'
+            '<span style="font-size:0.75rem;color:#64748b;">'
+            '&nbsp;Upload your CV or Resume - AI reads it and fills all sections for your review'
+            '</span></div>',
+            unsafe_allow_html=True
+        )
+        _rcu1, _rcu2 = st.columns([5, 1])
+        with _rcu1:
+            resume_file = st.file_uploader("Upload CV or Resume",
+                type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
+                key="up_resume", label_visibility="collapsed")
+        with _rcu2:
             st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-            if sec_file and st.button("Extract", key="run_personal", use_container_width=True):
-                with st.spinner("Extracting personal information..."):
-                    ext = Path(sec_file.name).suffix.lower()
+            if resume_file and st.button("Extract", key="run_resume", use_container_width=True):
+                with st.spinner("Running resume pipeline..."):
+                    ext = Path(resume_file.name).suffix.lower()
                     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                        tmp.write(sec_file.read()); tmp_path = tmp.name
+                        tmp.write(resume_file.read()); tmp_path = tmp.name
                     try:
                         text = extract_text(tmp_path)
-                        result = call_llm(text, target_section="Personal Information")
+                        result = call_llm(text, is_resume=True)
                         if result:
                             result["is_vessel_document"] = False
-                            result["is_resume"] = False
-                            save_to_doc_tank(result, sec_file.name, "section",
-                                             result.get("document_type","Personal Information"),
-                                             False, False)
+                            result["is_resume"] = True
+                            save_to_doc_tank(result, resume_file.name, "master",
+                                             result.get("document_type", "CV / Resume"),
+                                             False, True)
                             st.session_state["popup"] = {
-                                "key": "sec_personal", "result": result,
-                                "filename": sec_file.name, "source": "section",
-                                "target_section": "Personal Information",
+                                "key": "resume_personal",
+                                "result": result,
+                                "filename": resume_file.name,
+                                "source": "master",
+                                "target_section": "Resume",
                                 "tank_id": st.session_state["doc_tank"][-1]["tank_id"]
                             }
                             st.rerun()
@@ -1538,61 +2027,73 @@ elif st.session_state["page"] == "My Profile":
                     if val: st.markdown(f'<div class="field-value">{val}</div>',unsafe_allow_html=True)
                     else:   st.markdown(f'<div class="field-empty">-</div>',unsafe_allow_html=True)
         if profile:
-            eb1, eb2 = st.columns(2)
-            with eb1:
-                if st.button("Edit All Personal Info", key="edit_personal_all", use_container_width=True):
-                    edit_row = {}
-                    for fk, fl in PERSONAL_FIELDS:
-                        # ORG_MAP maps field_key -> org display key e.g. "person_name" -> "Full Name"
-                        org_key = ORG_MAP.get(fk, fl)
-                        edit_row[fl] = profile.get(org_key, "") or ""
-                    st.session_state["subpopup"] = {
-                        "section": "Personal Information",
-                        "row_idx": 0,
-                        "row": edit_row,
-                        "key": "personal_edit_all",
-                        "source": "personal"
-                    }
-                    st.rerun()
-            with eb2:
-                if st.button("Clear Personal Info", key="clear_personal", use_container_width=True):
-                    st.session_state["profile"] = {}; st.rerun()
+            if st.button("Clear Personal Info", key="clear_personal"):
+                st.session_state["profile"] = {}; st.rerun()
 
-    # Multi-row sections
-    for section_name,cols_def in SECTION_COLUMNS.items():
+    # Multi-row sections - ordered display list (internal key, display label)
+    _CREW_ORDER = [
+        ("Sea Service Experience",     "Experience"),
+        ("Licenses and Certification", "Licenses and Certifications"),
+        ("Medical",                    "Medical"),
+        ("Education",                  "Education"),
+        ("Courses",                    "Courses"),
+        ("Bank Details",               "Bank Details"),
+        ("Travel Documents",           "Travel Documents"),
+    ]
+    for (section_name, display_name), _tab_sec in zip(_CREW_ORDER, _crew_tabs[1:8]):
+        cols_def = SECTION_COLUMNS[section_name]
         rows=st.session_state["sections"].get(section_name,[])
-        with st.expander(f"{section_name}  ({len(rows)} record{'s' if len(rows)!=1 else ''})",expanded=False):
-            uc1,uc2=st.columns([4,1])
-            with uc1:
-                sec_file=st.file_uploader(f"Upload for {section_name}",
-                    type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
-                    key=f"up_{section_name}",label_visibility="collapsed")
-            with uc2:
-                st.markdown("<div style='height:4px'></div>",unsafe_allow_html=True)
-                if sec_file and st.button("Extract", key=f"run_{section_name}", use_container_width=True):
-                    with st.spinner(f"Extracting {section_name}..."):
-                        ext = Path(sec_file.name).suffix.lower()
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                            tmp.write(sec_file.read()); tmp_path = tmp.name
-                        try:
-                            text = extract_text(tmp_path)
-                            # Direct section-specific call - no classify step needed
-                            result = call_llm(text, target_section=section_name)
-                            if result:
-                                result["is_vessel_document"] = False
-                                result["is_resume"] = False
-                                save_to_doc_tank(result, sec_file.name, "section",
-                                                 result.get("document_type", section_name),
-                                                 False, False)
-                                st.session_state["popup"] = {
-                                    "key": f"sec_{section_name.replace(' ','_')}",
-                                    "result": result, "filename": sec_file.name,
-                                    "source": "section", "target_section": section_name,
-                                    "tank_id": st.session_state["doc_tank"][-1]["tank_id"]
-                                }
-                                st.rerun()
-                        except Exception as e:
-                            st.error(f"Error: {e}")
+        with _tab_sec:
+            st.markdown(
+                f'<div style="font-size:0.8rem;color:#64748b;margin-bottom:8px;">'
+                f'{len(rows)} record{"s" if len(rows)!=1 else ""}</div>',
+                unsafe_allow_html=True
+            )
+            # Top action buttons
+            _btn_add, _btn_up = st.columns(2)
+            with _btn_add:
+                if st.button(f"+ Add {display_name}", key=f"add_{section_name}", use_container_width=True):
+                    st.session_state["sections"][section_name].append({c:"" for c in cols_def})
+                    st.rerun()
+            with _btn_up:
+                if st.button("✨ AI Autofill", key=f"toggle_up_{section_name}", use_container_width=True):
+                    _tk = f"show_up_{section_name}"
+                    st.session_state[_tk] = not st.session_state.get(_tk, False)
+                    st.rerun()
+                st.caption("Upload a document - AI extracts and fills for you")
+
+            if st.session_state.get(f"show_up_{section_name}", False):
+                uc1, uc2 = st.columns([4, 1])
+                with uc1:
+                    sec_file = st.file_uploader(f"Upload for {section_name}",
+                        type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
+                        key=f"up_{section_name}", label_visibility="collapsed")
+                with uc2:
+                    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+                    if sec_file and st.button("Extract", key=f"run_{section_name}", use_container_width=True):
+                        with st.spinner(f"Extracting {section_name}..."):
+                            ext = Path(sec_file.name).suffix.lower()
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                                tmp.write(sec_file.read()); tmp_path = tmp.name
+                            try:
+                                text = extract_text(tmp_path)
+                                # Direct section-specific call - no classify step needed
+                                result = call_llm(text, target_section=section_name)
+                                if result:
+                                    result["is_vessel_document"] = False
+                                    result["is_resume"] = False
+                                    save_to_doc_tank(result, sec_file.name, "section",
+                                                     result.get("document_type", section_name),
+                                                     False, False, section_name=section_name)
+                                    st.session_state["popup"] = {
+                                        "key": f"sec_{section_name.replace(' ','_')}",
+                                        "result": result, "filename": sec_file.name,
+                                        "source": "section", "target_section": section_name,
+                                        "tank_id": st.session_state["doc_tank"][-1]["tank_id"]
+                                    }
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
 
             st.markdown("<hr style='margin:8px 0;border-color:#f1f5f9;'>",unsafe_allow_html=True)
 
@@ -1612,21 +2113,29 @@ elif st.session_state["page"] == "My Profile":
 
             render_section_content(section_name, rows, key_prefix=f"profile_{section_name}", view_mode=st.session_state[view_key])
 
-            ba,bb=st.columns(2)
-            with ba:
-                if st.button(f"+ Add blank row",key=f"add_{section_name}"):
-                    st.session_state["sections"][section_name].append({c:"" for c in cols_def})
-                    st.rerun()
-            with bb:
-                if rows and st.button(f"Clear all",key=f"clear_{section_name}"):
-                    st.session_state["sections"][section_name]=[]; st.rerun()
+            if rows and st.button(f"Clear all", key=f"clear_{section_name}"):
+                st.session_state["sections"][section_name]=[]; st.rerun()
+
+    # Placeholder tabs - no functionality yet
+    with _crew_tabs[8]:
+        st.markdown('<div class="field-empty" style="text-align:center;padding:16px;">Coming soon.</div>', unsafe_allow_html=True)
+    with _crew_tabs[9]:
+        st.markdown('<div class="field-empty" style="text-align:center;padding:16px;">Coming soon.</div>', unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════════
 #  VESSELS
 # ════════════════════════════════════════════════════════════
-elif st.session_state["page"] == "Vessels":
+elif st.session_state["page"] == "Vessel":
     st.markdown("### Vessels - Certificate Registry")
-    st.markdown("<div style='font-size:0.85rem;color:#64748b;margin-bottom:16px;'>Upload vessel certificates to populate. Each certificate is stored as one row.</div>", unsafe_allow_html=True)
+    st.markdown(
+        '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
+        '<span style="font-size:1.1rem;">✨</span>'
+        '<span style="font-size:0.9rem;font-weight:700;color:#0f172a;">AI Certificate Import</span>'
+        '<span style="font-size:0.75rem;color:#64748b;">'
+        '&nbsp;Upload a vessel certificate - AI extracts the details for your review'
+        '</span></div>',
+        unsafe_allow_html=True
+    )
 
     vc1,vc2=st.columns([4,1])
     with vc1:
@@ -1684,72 +2193,172 @@ elif st.session_state["page"] == "Vessels":
 # ════════════════════════════════════════════════════════════
 elif st.session_state["page"] == "Doc Tank":
     st.markdown("### Doc Tank - Upload Log")
+
+    # ── MASTER UPLOAD ─────────────────────────────────────────
+    mu1, mu2 = st.columns([4, 1])
+    with mu1:
+        st.markdown(
+            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+            '<span style="font-size:1.1rem;">✨</span>'
+            '<span style="font-size:0.9rem;font-weight:700;color:#0f172a;">AI Smart Import</span>'
+            '<span style="font-size:0.75rem;color:#64748b;">'
+            '&nbsp;Upload any doc - CV, certificate, or merged PDF - AI classifies and fills automatically'
+            '</span></div>',
+            unsafe_allow_html=True
+        )
+        master_file = st.file_uploader("master", type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
+                                       label_visibility="collapsed", key="master_uploader")
+    with mu2:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if master_file and st.button("Run Pipeline", use_container_width=True, key="run_master"):
+            with st.spinner("Classifying document..."):
+                ext = Path(master_file.name).suffix.lower()
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                    tmp.write(master_file.read()); tmp_path = tmp.name
+                try:
+                    text = extract_text(tmp_path)
+
+                    # Call 1 - lightweight classify
+                    clf = classify_document(text)
+                    if not clf:
+                        st.error("Classification failed."); st.stop()
+
+                    is_vessel  = clf.get("is_vessel", False)
+                    is_resume  = clf.get("is_resume", False)
+                    target_sec = clf.get("target_section", "")
+                    doc_type   = clf.get("doc_type", "")
+
+                    # Call 2 - targeted extraction
+                    with st.spinner(f"Extracting: {doc_type or target_sec}..."):
+                        result = call_llm(text,
+                                          target_section=target_sec,
+                                          is_vessel=is_vessel,
+                                          is_resume=is_resume)
+
+                    if result:
+                        # Stamp doc_type from classifier if LLM didn't fill it
+                        if not result.get("document_type") and doc_type:
+                            result["document_type"] = doc_type
+                        result["is_vessel_document"] = is_vessel
+                        result["is_resume"] = is_resume
+                        save_to_doc_tank(result, master_file.name, "master",
+                                         result.get("document_type", doc_type),
+                                         is_vessel, is_resume)
+                        st.session_state["popup"] = {
+                            "key": "master", "result": result,
+                            "filename": master_file.name, "source": "master",
+                            "target_section": target_sec,
+                            "tank_id": st.session_state["doc_tank"][-1]["tank_id"]
+                        }
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    st.markdown("<hr style='margin:8px 0;border-color:#f1f5f9;'>", unsafe_allow_html=True)
+
     tank = st.session_state.get("doc_tank", [])
 
+    if "dt_view" not in st.session_state:
+        st.session_state["dt_view"] = "crew"
+    _dtb1, _dtb2, _ = st.columns([2, 2, 8])
+    with _dtb1:
+        if st.button("Crew", key="dt_btn_crew", use_container_width=True,
+                     type="primary" if st.session_state["dt_view"] == "crew" else "secondary"):
+            st.session_state["dt_view"] = "crew"; st.rerun()
+    with _dtb2:
+        if st.button("Vessel", key="dt_btn_vessel", use_container_width=True,
+                     type="primary" if st.session_state["dt_view"] == "vessel" else "secondary"):
+            st.session_state["dt_view"] = "vessel"; st.rerun()
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    _show_vessel = (st.session_state["dt_view"] == "vessel")
+
     if not tank:
-        st.info("No documents processed yet.")
+        st.markdown('<div class="field-empty" style="text-align:center;padding:16px;">No documents processed yet.</div>', unsafe_allow_html=True)
     else:
-        s1,s2,s3,s4,s5 = st.columns(5)
+        s1,s2,s3,s4,s5,s6 = st.columns(6)
         s1.metric("Total",    len(tank))
         s2.metric("Pending",  len([d for d in tank if d.get("status")=="Pending"]))
-        s3.metric("Approved", len([d for d in tank if d.get("status")=="Approved"]))
-        s4.metric("Vessel",   len([d for d in tank if d.get("is_vessel")]))
-        s5.metric("CV/Resume",len([d for d in tank if d.get("is_resume")]))
+        s3.metric("Draft",    len([d for d in tank if d.get("status")=="Draft"]))
+        s4.metric("Approved", len([d for d in tank if d.get("status") in ("Approved","Partial")]))
+        s5.metric("Vessel",   len([d for d in tank if d.get("is_vessel")]))
+        s6.metric("CV/Resume",len([d for d in tank if d.get("is_resume")]))
         st.markdown("---")
-
-        for i, doc in enumerate(reversed(tank)):
-            idx = len(tank) - 1 - i
-            status     = doc.get("status", "Pending")
-            status_cls = "status-matched" if status == "Approved" else "status-verify"
-
-            # Approved fields summary for display
-            approved_fields = doc.get("approved_fields", [])
-
-            col_label, col_status, col_open, col_del = st.columns([4, 1, 1, 1])
-
-            with col_label:
-                st.markdown(
-                    f'<div style="padding:8px 0;">'
-                    f'<div style="font-size:0.85rem;font-weight:600;color:#1e293b;">{doc["filename"]}</div>'
-                    f'<div style="font-size:0.72rem;color:#64748b;">{doc["timestamp"]} &nbsp;|&nbsp; {doc["document_type"]}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-            with col_status:
-                st.markdown(
-                    f'<div style="padding-top:12px;">'
-                    f'<span class="{status_cls}">{status}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-            with col_open:
-                if st.button("Open", key=f"dt_open_{idx}", use_container_width=True):
-                    # Load this doc tank entry into popup state
-                    # exactly as if it was just uploaded
-                    raw = doc.get("raw_result", {})
-                    st.session_state["popup"] = {
-                        "key":            f"dt_{idx}",
-                        "result":         raw,
-                        "filename":       doc["filename"],
-                        "source":         "doc_tank",
-                        "target_section": doc.get("target_section", ""),
-                        "tank_id":        doc.get("tank_id", ""),
-                        "tank_idx":       idx,
-                        "tank_status":    status,
-                        "approved_fields": approved_fields,
-                    }
-                    st.rerun()
-            with col_del:
-                if st.button("Delete", key=f"dt_del_{idx}", use_container_width=True):
-                    st.session_state["doc_tank"].pop(idx)
-                    st.rerun()
-
-            # Show approved fields summary if doc was approved
-            if approved_fields:
-                with st.expander(f"Approved fields ({len(approved_fields)})", expanded=False):
-                    af_cols = st.columns(3)
-                    for afi, af in enumerate(approved_fields):
-                        with af_cols[afi % 3]:
-                            st.markdown(f'<span class="status-matched" style="margin:2px;display:inline-block;">{af}</span>', unsafe_allow_html=True)
-
-            st.markdown("<hr style='margin:4px 0;border-color:#f1f5f9;'>", unsafe_allow_html=True)
+        _filtered = [
+            (len(tank)-1-i, doc)
+            for i, doc in enumerate(reversed(tank))
+            if bool(doc.get("is_vessel")) == _show_vessel
+        ]
+        if not _filtered:
+            st.markdown('<div class="field-empty" style="text-align:center;padding:16px;">No documents in this category.</div>', unsafe_allow_html=True)
+        else:
+            for idx, doc in _filtered:
+                status     = doc.get("status", "Pending")
+                if status == "Approved":
+                    status_cls = "status-matched"
+                elif status in ("Partial", "Draft"):
+                    status_cls = "status-verify"
+                else:
+                    status_cls = "status-manual"
+                approved_fields = doc.get("approved_fields", [])
+                col_label, col_status, col_open, col_del = st.columns([4, 1, 1, 1])
+                with col_label:
+                    _src      = doc.get("source", "")
+                    _sec      = doc.get("section_name", "")
+                    if _src == "vessel":
+                        _src_label = "Vessel Registry"
+                        _src_color = "#0ea5e9"
+                    elif _src == "section" and _sec:
+                        _src_label = f"Crew / {_sec}"
+                        _src_color = "#8b5cf6"
+                    elif _src == "section":
+                        _src_label = "Crew / Section Upload"
+                        _src_color = "#8b5cf6"
+                    elif _src == "master" and doc.get("is_resume"):
+                        _src_label = "Crew / Resume Upload"
+                        _src_color = "#8b5cf6"
+                    else:
+                        _src_label = "Doc Tank / Smart Import"
+                        _src_color = "#64748b"
+                    st.markdown(
+                        f'<div style="padding:8px 0;">'
+                        f'<div style="font-size:0.85rem;font-weight:600;color:#1e293b;">{doc["filename"]}</div>'
+                        f'<div style="font-size:0.72rem;color:#64748b;">{doc["timestamp"]} &nbsp;|&nbsp; {doc["document_type"]}</div>'
+                        f'<div style="font-size:0.68rem;color:{_src_color};margin-top:2px;">&#x2022; {_src_label}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
+                with col_status:
+                    st.markdown(
+                        f'<div style="padding-top:12px;">'
+                        f'<span class="{status_cls}">{status}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
+                with col_open:
+                    if st.button("Open", key=f"dt_open_{idx}", use_container_width=True):
+                        raw = doc.get("raw_result", {})
+                        st.session_state["popup"] = {
+                            "key":            f"dt_{idx}",
+                            "result":         copy.deepcopy(raw),
+                            "filename":       doc["filename"],
+                            "source":         "doc_tank",
+                            "target_section": doc.get("target_section", ""),
+                            "tank_id":        doc.get("tank_id", ""),
+                            "tank_idx":       idx,
+                            "tank_status":    status,
+                            "approved_fields": approved_fields,
+                            "draft_state":    doc.get("draft_state"),
+                        }
+                        st.session_state["popup_confirm_approve"] = False
+                        st.rerun()
+                with col_del:
+                    if st.button("Delete", key=f"dt_del_{idx}", use_container_width=True):
+                        st.session_state["doc_tank"].pop(idx)
+                        st.rerun()
+                if approved_fields:
+                    with st.expander(f"Approved fields ({len(approved_fields)})", expanded=False):
+                        af_cols = st.columns(3)
+                        for afi, af in enumerate(approved_fields):
+                            with af_cols[afi % 3]:
+                                st.markdown(f'<span class="status-matched" style="margin:2px;display:inline-block;">{af}</span>', unsafe_allow_html=True)
+                st.markdown("<hr style='margin:4px 0;border-color:#f1f5f9;'>", unsafe_allow_html=True)
