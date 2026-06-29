@@ -3,13 +3,19 @@ import json, re, os, tempfile, copy
 from difflib import SequenceMatcher
 from pathlib import Path
 from datetime import datetime
-from groq import Groq
-import fitz
-import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
-from docx import Document as DocxDocument
-import openpyxl
 import pandas as pd
+
+# ── MODULE IMPORTS ────────────────────────────────────────────
+from data import (
+    PERSONAL_FIELDS, SECTION_COLUMNS, VESSEL_COLUMNS, DROPDOWN_FIELDS,
+    ALL_ORG_OPTIONS, ORG_PREMAP,
+)
+from mapping import (
+    fuzzy_match_dropdown, validate_field_value, check_dropdown_validity,
+    get_dropdown_options, field_coherence,
+    personal_to_profile, result_to_rows, vessel_result_to_row,
+)
+from pipeline import extract_text, classify_document, call_llm
 
 st.set_page_config(page_title="SeaBotics.ai", page_icon="S", layout="wide", initial_sidebar_state="expanded")
 
@@ -35,385 +41,8 @@ html, body, [class*="css"] { font-family: 'Segoe UI', sans-serif; }
 </style>
 """, unsafe_allow_html=True)
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-MODEL_NAME   = "llama-3.3-70b-versatile"
 
-# ── DROPDOWN REFERENCE DATA ───────────────────────────────────
-
-LICENSES_CERT_DROPDOWN = {
-    "STCW - CERTIFICATE OF COMPETENCY": [
-        "3RD OFFICER I/2, II/1","2ND ENGINEER MOTOR I/2, III/2",
-        "OFFICER IN CHARGE - NAVIGATIONAL WATCH 1/2, II/1","2ND OFFICER I/2, II/1",
-        "4TH ENGINEER MOTOR & STEAM 1/2, III/1","ELECTRICAL OFFICER I/2, III/6",
-        "3RD ENGINEER MOTOR I/2, III/1","4TH ENGINEER STEAM I/2, III/1",
-        "GMDSS GENERAL OPERATOR CERTIFICATE 1/2, IV/2",
-        "OIC - ENGINEERING WATCH MOTOR & STEAM 1/2, III/1",
-        "CHIEF ENGINEER MOTOR I/2, III/2","CHIEF OFFICER I/2, II/2",
-        "OIC - ENGINEERING WATCH STEAM 1/2, III/1","2ND ENGINEER STEAM 1/2, III/2",
-        "3RD ENGINEER MOTOR & STEAM 1/2, III/1","MASTER I/2, II/2",
-        "Dangerous Cargo","CLASS 1","JUNIOR ENGINEER STEAM III/1",
-    ],
-    "STCW - CERTIFICATE OF PROFICIENCY": [
-        "RATING ENGINEERING WATCH I/2, III/4","ABLE SEAMAN ENGINE 1/2, III/5",
-    ],
-    "STCW - ENDORSMENT": [
-        "DANGEROUS CARGO (CHEM) ENDORSEMENT-OPERATIONS",
-        "GMDSS CERTIFICATE OF ENDORSEMENT (NATIONAL)",
-        "DANGEROUS CARGO (OIL) ENDORSEMENT - SUPPORT",
-        "DANGEROUS CARGO (OIL) ENDORSEMENT - MANAGEMENT",
-    ],
-    "FLAG - FLAG ENDORSEMENT": [
-        "DANGEROUS CARGO (OIL) ENDORSEMENT - OPERATI","SHIPS COOK MLC2006, 1/10",
-        "DANGEROUS CARGO (OIL) ENDORSEMENT - SUPPOR","3RD OFFICER II/1, 1/10",
-        "4TH ENGINEER MOTOR III/1, 1/10","ELECTRICAL OFFFICER III/6, 1/10",
-        "ABLE SEAMAN DECK II/5, 1/10","RATING NAVIGATIONAL WATCH II/4, 1/10",
-        "CHIEF ENGINEER MOTOR & STEAM III/2, 1/10",
-        "DANGEROUS CARGO (OIL) ENDORSEMENT MANAGM",
-        "OIC ENGINEERING WATCH MOTOR III/1, 1/10","CHIEF ENGINEER STEAM III/2, 1/10",
-        "DANGEROUS CARGO (CHEM) ENDORSEMENT - OPERA",
-        "RECEIPT OF APPLICATION (ROA) FOR COC/Certificate",
-        "2ND ENGINEER MOTOR III/2, 1/10","2ND OFFICER II/1, 1/10",
-        "3RD ENGINEER MOTOR III/1, 1/10",
-        "DANGEROUS CARGO (CHEM) ENDORSEMENT - SUPPO",
-        "RATING ENGINEERING WATCH III/4, 1/10",
-        "RECEIPT OF APPLICATION (ROA) FOR GMDSS GOC FL.",
-        "ELECTRICAL RATING III/7, 1/10","4TH ENGINEER MOTOR & STEAM III/1, 1/10",
-        "ABLE SEAMAN ENGINE III/5, 1/10",
-        "OIC ENGINEERING WATCH MOTOR & STEAM III/1, 1/10",
-        "CHIEF ENGINEER MOTOR III/2, 1/10","2ND ENGINEER MOTOR & STEAM III/2, 1/10",
-        "4TH ENGINEER STEAM III/1, 1/10","CHIEF OFFICER II/2, 1/10",
-        "JUNIOR ENGINEER STEAM III/1, 1/10",
-    ],
-}
-
-COURSES_DROPDOWN = {
-    "STCW": [
-        "ADVANCED CHEMICAL TANKER TRAINING",
-        "ADVANCED TRAINING LIQUIFIED GAS TANKER CARGO OIL",
-        "ADVANCED TRAINING CHEMICAL TANKER CARGO OPERATION",
-        "ADVANCED OIL TANKER TRAINING","ADVANCED FIRE FIGHTING",
-        "BASIC SAFETY TRAINING (FPFF, PSSR, PST, EFA)",
-    ],
-    "FLAG Endorsement": ["SHIP SECURITY OFFICER VI/5, I/10"],
-    "Value Added": [
-        "6G CERTIFICATE","ABB TURBO CHARGER COURSE",
-        "AUTOMATIC IDENTIFICATION SYSTEM (AIS)","BASIC ARC WELDING",
-        "BASIC LATHE MACHINE OPERATION","BEHAVIOUR BASED SAFETY","CATERING",
-        "CRUDE OIL WASHING & INERT GAS SYSTEM (COW/IGS)","MARITIME ENGLISH",
-        "MARITIME LABOUR CONVENTION (MLC) 2006","MARPOL",
-        "PORT STATE CONTROL INSPECTION","RISK ASSESSMENT AND INCIDENT INVESTIGATION",
-        "VERY LARGE VESSEL HANDLING COURSE","VESSEL HANDLING COURSE",
-    ],
-    "Other": [
-        "ALFA LAVAL PURIFIER COURSE","HYDRAULICS AND PNEUMATICS",
-        "NAVIGATIONAL AIDS (BRIDGE EQUIPMENT)",
-        "REFRESHER - BRIDGE RESOURCE MANAGEMENT",
-        "REFRESHER - ENGINE ROOM RESOURCE MANAGEMENT",
-        "SHIP SAFETY OFFICER COURSE",
-    ],
-}
-
-MEDICAL_DROPDOWN = {
-    "Medical Test": [
-        "D&A - Drug & Alcohol Test",
-        "PEME - Pre-Employment Medical Examination",
-        "LFT-Liver Function Test (Post Sign Off From Chemical Tanker)",
-        "Treadmill Cardiogram",
-    ],
-    "Vaccination": [
-        "Yellow Fever","COVID 19","VACCINE DOCUMENT","COVID 3rd Dose",
-    ],
-}
-
-VOYAGE_TYPES   = ["Foreign Going","Near Coastal","Coastal","Home Trade"]
-VESSEL_TYPES   = ["BULK CARRIER","CHEMICAL TANKER","CONTAINER SHIP","CRUISE SHIP",
-                  "GAS CARRIER","GENERAL CARGO SHIP","LIVESTOCK CARRIER",
-                  "OIL TANKER","RO-RO SHIP","TUGBOAT"]
-
-VESSEL_CERT_CATEGORIES = {
-    "Class": [
-        "Annual Survey","Annual Survey (Fi-Fi)","Annual Survey (UMS)",
-        "Annual Survey IG System","Auxiliary Boiler Survey",
-        "Auxiliary Boiler Survey (Exhaust Gas)","Auxiliary Boiler Survey (Oil Fired) Port",
-        "Auxiliary Boiler Survey (Oil Fired) Stbd","Cargo Gear Annual Survey",
-        "Cargo Gear Renewal Survey","Continuous Survey (Fi-Fi)","Continuous Survey Hull",
-        "Continuous Survey Machinery","Docking Survey","EIAPP Change of Flag Survey",
-        "Exhaust Gas Steam Generators and Economisers Survey","General Examination",
-        "In Water Survey","Intermediate Survey","Issuance of COC(SEEMP Part II)",
-        "Issuance of COC(SEEMP Part III)","Main Boiler survey","Special Survey ( Fi-Fi)",
-        "Special Survey (UMS)","Special Survey Hull","Special Survey IG system",
-        "Special Survey Machiney","Tail Shaft Survey",
-        "Tailshaft Condition Monitoring Annual Survey","Tailshaft Initial Survey",
-        "Tailshaft Periodical Survey","Tailshaft Renewal Survey",
-        "Thermal Oil Heating Systems Survey","Certificate of Class","Certificate of Fitness",
-        "CERTIFICATE OF TEST AND THOROUGH EXAMINATION OF LIFTING APPLIANCES CG 2",
-        "REGISTER OF LIFTING APPLIANCES AND CARGO HANDLING GEAR",
-        "ENGINE INTERNATIONAL AIR POLLUTION PREVENTION CERTIFICATE",
-    ],
-    "Flag State": [
-        "Safety Equipment Certificate","Safety Radio Certificate",
-        "Safety Construction Certificate","International Loadline Certificate",
-        "International Oil Pollution Prevention Certificate",
-        "International Ship Security Certificate","Maritime Labour Certificate",
-        "Minimum Safe Manning Certificate","ISM Safety Management Certificate",
-        "Document of Compliance","USCG Certificate of Compliance",
-        "Civil Liability Convention (CLC) 1992 Certificate:",
-        "Civil Liability for Bunker Oil Pollution Damage Convention (CLBC) Certificate:",
-        "Liability for the Removal of Wrecks Certificate",
-        "U.S. Certificate of Financial Responsibility","Certificate of Registry",
-        "International Sewage Pollution Prevention Certificate",
-        "International Energy Efficiency Certificate",
-        "International Air Pollution Prevention Certificate",
-        "Ship Sanitation Control (SSCC)/Ship Sanitation Control Exemption",
-        "International Ballast Water Management Certificate",
-        "International Anti-Fouling System Certificate",
-        "CONFIRMATION OF COMPLIANCE - SEEMP PART II",
-        "CONFIRMATION OF COMPLIANCE - SEEMP PART III",
-        "STATEMENT OF COMPLIANCE FOR INVENTORY OF HAZARDOUS MATERIALS",
-        "DOCUMENT OF COMPLIANCE FOR THE CARRIAGE OF DANGEROUS GOODS",
-        "CARRIAGE OF SOLID BULK CARGOES CERTIFICATE OF COMPLIANCE",
-        "INTERNATIONAL TONNAGE CERTIFICATE",
-        "INTERNATIONAL GARBAGE POLLUTION PREVENTION CERTIFICATE",
-        "POLAR SHIP CERTIFICATE",
-    ],
-    "Statutory": [
-        "AFS Change of Flag Survey","AFS Initial Survey","AFS Issuance Survey",
-        "AFS Periodical Survey","IAPP Annual Survey","IAPP Change of Flag Survey",
-        "IAPP General Examination Survey","IAPP Initial Survey","IAPP Intermediate Survey",
-        "IAPP Renewal Survey","IBWMC Annual Survey","IBWMC Change of Flag Survey",
-        "IBWMC General Examination Survey","IBWMC Renewal Survey",
-        "ICOF ( CHEM ) Change of Flag Survey","ICOF ( CHEM ) General Examination Survey",
-        "ICOF ( CHEM ) Initial Survey","ICOF ( CHEM ) Renewal Survey",
-        "ICOF ( GAS ) Annual Survey","ICOF ( GAS ) Change of Flag Survey",
-        "ICOF ( GAS ) General Examination Survey","ICOF ( GAS ) Initial Survey",
-        "ICOF ( GAS ) Intermediate Survey","ICOF ( GAS ) Renewal Survey",
-        "ICOF (CHEM ) Annual Survey","ICOF (CHEM ) Intermediate Survey",
-        "IEEC Change of Flag Survey","IEEC Initial Survey","IEEC Issuance Survey",
-        "IMDG Change of Flag Survey","IMDG Genaral Examination Survey",
-        "IMDG Initial Survey","IMDG Renewal Survey","IMSBC Change of Flag Survey",
-        "IMSBC Genaral Examination Survey","IMSBC Initial Survey","IMSBC Renewal Survey",
-        "IGPP Change of Flag Survey","International Load Line Annual Survey",
-        "International Load Line Change of Flag Survey",
-        "International Load Line General Examination Survey",
-        "International Load Line Initial Survey","International Load Line Renewal Survey",
-        "International Tonnage Survey",
-        "Inventory of Hazardous Material (HKC) Annual Survey",
-        "Inventory of Hazardous Material (HKC) Change of Flag Survey",
-        "Inventory of Hazardous Material (HKC) General Examination Survey",
-        "Inventory of Hazardous Material (HKC) Renewal Survey",
-        "Inventory of Hazardous Material(s)-EU Annual Survey",
-        "Inventory of Hazardous Material(s)-EU Change of Flag Survey",
-        "Inventory of Hazardous Material(s)-EU General Examination Survey",
-        "Inventory of Hazardous Material(s)-EU Renewal Survey",
-        "IOPP Annual Survey","IOPP Change of Flag Survey","IOPP General Examination Survey",
-        "IOPP Initial Survey","IOPP Intermediate Survey","IOPP Renewal Survey",
-        "ISM DOC Annual Survey","ISM DOC Initial Survey","ISM DOC interim Survey",
-        "ISM DOC Renewal Survey","ISPP Change of Flag Survey",
-        "ISPP General Examination Survey","ISPP Initial Survey","ISPP Renewal Survey",
-        "ISSC Initial Survey","ISSC Interim Audit","ISSC Intermediate Survey",
-        "ISSC Renewal Survey","MLC Interim Audit","PSC Intermediate Survey",
-        "PSC Annual Survey","PSC Change of Flag Survey","PSC General Examination Survey",
-        "PSC Initial Survey","PSC Renewal Survey","SAFCON Annual Survey",
-        "SAFCON Change of Flag Survey","SAFCON General Examination Survey",
-        "SAFCON Initial Survey","SAFCON Intermediate Survey","SAFCON Renewal Survey",
-        "SEQ Annual Survey","SEQ Change of Flag Survey","SEQ General Examination Survey",
-        "SEQ Initial Survey","SEQ Intermediate Survey","SEQ Periodical Survey",
-        "SEQ Renewal Survey","SMC Initial Survey","SMC Interim Audit",
-        "SMC Intermediate Survey","SMC Renewal Survey","SRT Annual Survey",
-        "SRT Change of Flag Survey","SRT General Examination Survey","SRT Initial Survey",
-        "SRT Periodical Survey","SRT Renewal Survey",
-    ],
-}
-
-VESSEL_CERT_TYPES = ["Interim","Full Term","Short Term"]
-
-ALL_LICENSE_NAMES  = [n for names in LICENSES_CERT_DROPDOWN.values() for n in names]
-ALL_LICENSE_TYPES  = list(LICENSES_CERT_DROPDOWN.keys())
-ALL_COURSE_NAMES   = [n for names in COURSES_DROPDOWN.values() for n in names]
-ALL_COURSE_TYPES   = list(COURSES_DROPDOWN.keys())
-ALL_MEDICAL_NAMES  = [n for names in MEDICAL_DROPDOWN.values() for n in names]
-ALL_MEDICAL_TYPES  = list(MEDICAL_DROPDOWN.keys())
-ALL_VESSEL_CATS    = list(VESSEL_CERT_CATEGORIES.keys())
-ALL_VESSEL_NAMES   = [n for names in VESSEL_CERT_CATEGORIES.values() for n in names]
-
-ALL_GENDER_OPTIONS    = ["Male", "Female", "Prefer Not to mention", "Other"]
-ALL_RANK_OPTIONS      = [
-    "Master", "Chief Officer", "Second Officer", "Third Officer",
-    "Chief Engineer", "Second Engineer", "Third Engineer", "Fourth Engineer",
-    "Electrical Officer", "Bosun", "Able Seaman", "Ordinary Seaman",
-    "Deck Cadet", "Engine Cadet", "Fitter", "Oiler", "Wiper",
-    "Chief Steward", "Steward", "Cook", "Messman",
-]
-ALL_SHIRT_SIZES       = ["XS", "S", "M", "L", "XL", "XXL", "XXXL"]
-ALL_TROUSER_SIZES     = ["XS", "S", "M", "L", "XL", "XXL", "XXXL"]
-ALL_BOILER_SUIT_SIZES = ["XS", "S", "M", "L", "XL", "XXL", "XXXL"]
-
-# ── SECTION DEFINITIONS ───────────────────────────────────────
-PERSONAL_FIELDS = [
-    ("person_name","Full Name"),("surname","Surname"),("email","Email"),
-    ("gender","Gender"),("contact_number","Contact Number"),
-    ("date_of_birth","Date of Birth"),("nationality","Nationality"),
-    ("blood_group","Blood Group"),("rank","Current Rank"),
-    ("identification_mark","Identification Mark"),("availability_date","Availability Date"),
-    ("address","Address"),("country","Country"),("state","State"),
-    ("zip_code","ZIP / PIN Code"),("domestic_airport","Domestic Airport"),
-    ("international_airport","International Airport"),
-    ("passport_number","Passport Number"),("cdc_number","CDC / Seaman's Book Number"),
-    ("height","Height"),("weight","Weight"),
-    ("boiler_suit_size","Boiler Suit Size"),("safety_shoe_size","Safety Shoe Size"),
-    ("shirt_size","Shirt Size"),("trouser_size","Trouser Size"),
-]
-
-SECTION_COLUMNS = {
-    "Medical": ["Document Type","Document Name","Certificate Number","Date of Issue","Date of Expiry"],
-    "Education": ["Institution Name","Country","Level of Education","Field of Study","Start Date","Completion Date"],
-    "Courses": ["Document Name","Certificate Number","Type","Place of Issue","Date of Issue","Date of Expiry"],
-    "Licenses and Certification": ["Document Name","Certificate Number","Type","Issuing Authority","Place of Issue","Date of Issue","Date of Expiry"],
-    "Travel Documents": ["Document Type","Document Name","Certificate Number","Place of Issue","Date of Issue","Date of Expiry"],
-    "Sea Service Experience": ["Company","Rank","Vessel Name","Vessel Type","Voyage Type","IMO Number","Flag / Country","GRT","DWT","BHP","Main Engine Type","Main Engine KW","Sign On Port","Sign Off Port","Start Date","End Date","Reason for Sign Off"],
-    "Bank Details": ["Bank Name","Branch Name","Account Type","Account Name","Account Number","IFSC / SWIFT Code"],
-}
-
-VESSEL_COLUMNS = ["Certificate Name","Certificate Category","Vessel","IMO Number","Certificate Number","Type","Issuing Authority","Classification Society","Date of Issue","Date of Expiry","Date of Survey"]
-
-# Dropdown-validated fields per section
-DROPDOWN_FIELDS = {
-    "Medical": {
-        "Document Type":  ALL_MEDICAL_TYPES,
-        "Document Name":  ALL_MEDICAL_NAMES,
-    },
-    "Courses": {
-        "Type":          ALL_COURSE_TYPES,
-        "Document Name": ALL_COURSE_NAMES,
-    },
-    "Licenses and Certification": {
-        "Type":          ALL_LICENSE_TYPES,
-        "Document Name": ALL_LICENSE_NAMES,
-    },
-    "Sea Service Experience": {
-        "Vessel Type":   VESSEL_TYPES,
-        "Voyage Type":   VOYAGE_TYPES,
-    },
-    "Vessels": {
-        "Certificate Category": ALL_VESSEL_CATS,
-        "Certificate Name":     ALL_VESSEL_NAMES,
-        "Type":                 VESSEL_CERT_TYPES,
-    },
-    "Personal Information": {
-        "Gender":           ALL_GENDER_OPTIONS,
-        "Current Rank":     ALL_RANK_OPTIONS,
-        "Shirt Size":       ALL_SHIRT_SIZES,
-        "Trouser Size":     ALL_TROUSER_SIZES,
-        "Boiler Suit Size": ALL_BOILER_SUIT_SIZES,
-    },
-}
-
-def fuzzy_match_dropdown(value, options):
-    """Find closest matching dropdown option using simple fuzzy logic."""
-    if not value or not options:
-        return None
-    val_upper = value.strip().upper()
-    # Exact match first
-    for opt in options:
-        if opt.upper() == val_upper:
-            return opt
-    # Contains match
-    for opt in options:
-        if val_upper in opt.upper() or opt.upper() in val_upper:
-            return opt
-    # Word overlap
-    val_words = set(val_upper.split())
-    best_match = None
-    best_score = 0
-    for opt in options:
-        opt_words = set(opt.upper().split())
-        overlap = len(val_words & opt_words)
-        if overlap > best_score:
-            best_score = overlap
-            best_match = opt
-    return best_match if best_score >= 1 else None
-
-def reclassify_courses_and_licenses(rows_dict):
-    """
-    Bottom-up reclassification for Courses and Licenses and Certification.
-    Fuzzy-matches extracted document names against reference lists.
-    Moves misclassified rows to the correct section and sets the correct type.
-    """
-    # Build reverse lookup: name -> type category
-    COURSE_NAME_TO_TYPE = {}
-    for cat, names in COURSES_DROPDOWN.items():
-        for name in names:
-            COURSE_NAME_TO_TYPE[name.upper()] = cat
-
-    LICENSE_NAME_TO_TYPE = {}
-    for cat, names in LICENSES_CERT_DROPDOWN.items():
-        for name in names:
-            LICENSE_NAME_TO_TYPE[name.upper()] = cat
-
-    final_courses  = []
-    final_licenses = []
-
-    # Pool all rows from both sections for reclassification
-    pool = []
-    for row in rows_dict.get("Courses", []):
-        pool.append(("Courses", row))
-    for row in rows_dict.get("Licenses and Certification", []):
-        pool.append(("Licenses and Certification", row))
-
-    for origin, row in pool:
-        doc_name = row.get("Document Name", "")
-
-        # Try matching against course names first
-        course_match = fuzzy_match_dropdown(doc_name, ALL_COURSE_NAMES)
-        license_match = fuzzy_match_dropdown(doc_name, ALL_LICENSE_NAMES)
-
-        # Score: exact/strong match wins
-        course_score  = _match_score(doc_name, course_match)
-        license_score = _match_score(doc_name, license_match)
-
-        if license_score >= course_score and license_match:
-            # Goes to Licenses and Certification
-            new_row = dict(row)
-            new_row["Document Name"] = license_match
-            new_row["Type"] = LICENSE_NAME_TO_TYPE.get(license_match.upper(), row.get("Type",""))
-            # Ensure license fields exist
-            if "Issuing Authority" not in new_row: new_row["Issuing Authority"] = ""
-            if "Place of Issue"    not in new_row: new_row["Place of Issue"]    = ""
-            final_licenses.append(new_row)
-
-        elif course_match:
-            # Goes to Courses
-            new_row = dict(row)
-            new_row["Document Name"] = course_match
-            new_row["Type"] = COURSE_NAME_TO_TYPE.get(course_match.upper(), row.get("Type",""))
-            final_courses.append(new_row)
-
-        else:
-            # No match found - keep in original section, flag it
-            if origin == "Courses":
-                final_courses.append(row)
-            else:
-                final_licenses.append(row)
-
-    rows_dict["Courses"] = final_courses
-    rows_dict["Licenses and Certification"] = final_licenses
-    return rows_dict
-
-
-def _match_score(original, matched):
-    """Score how well a fuzzy match landed. Higher = better."""
-    if not original or not matched:
-        return 0
-    orig_upper    = original.strip().upper()
-    matched_upper = matched.strip().upper()
-    if orig_upper == matched_upper:
-        return 3  # exact
-    if orig_upper in matched_upper or matched_upper in orig_upper:
-        return 2  # contains
-    orig_words    = set(orig_upper.split())
-    matched_words = set(matched_upper.split())
-    overlap       = len(orig_words & matched_words)
-    return overlap  # word overlap score
+# ── SESSION STATE ─────────────────────────────────────────────
 
 def init_state():
     if "profile"  not in st.session_state: st.session_state["profile"]  = {}
@@ -425,9 +54,11 @@ def init_state():
     if "page"     not in st.session_state: st.session_state["page"]     = "Crew"
     if "dt_popup" not in st.session_state: st.session_state["dt_popup"] = None
 
+init_state()
+
+
 def save_to_doc_tank(result, filename, source, doc_type, is_vessel, is_resume, section_name=None):
     """Save any uploaded doc to doc tank immediately as draft."""
-    # Avoid duplicate entries for same filename+timestamp
     ts = datetime.now().strftime("%d-%b-%Y %H:%M")
     st.session_state["doc_tank"].append({
         "timestamp":     ts,
@@ -442,364 +73,15 @@ def save_to_doc_tank(result, filename, source, doc_type, is_vessel, is_resume, s
         "tank_id":       f"{filename}_{ts}",
     })
 
-init_state()
 
-# ── CLASSIFIER PROMPT (Master Upload - call 1) ────────────────
-CLASSIFIER_PROMPT = """You are a maritime document classifier. Read the text and return ONLY valid JSON, no markdown.
-
-Classify the document and return:
-{
-  "is_vessel": false,
-  "is_resume": false,
-  "target_section": "",
-  "doc_type": ""
-}
-
-target_section must be one of:
-"Personal Information", "Medical", "Education", "Courses",
-"Licenses and Certification", "Travel Documents",
-"Sea Service Experience", "Bank Details", "Vessel"
-
-Rules:
-- is_vessel = true if document contains ship/vessel certificates, surveys, class/flag/statutory certs with IMO number but NO personal crew details
-- is_resume = true if document is a CV, resume, or sailing experience record covering multiple sections
-- If is_resume = true, set target_section = "Resume"
-- If is_vessel = true, set target_section = "Vessel"
-- Travel Documents: passport, CDC, seaman's book, visa, yellow fever card
-- Medical: PEME, D&A test, vaccination, medical fitness
-- Licenses and Certification: Certificate of Competency, Certificate of Proficiency, Endorsements, Flag Endorsements
-- Courses: STCW training, value-added courses, refresher courses, basic safety training
-- Education: degree, diploma, school certificate
-- Sea Service Experience: discharge book, sea service letter, vessel employment record
-- Bank Details: bank statement, account details, SWIFT/IFSC letter
-- Personal Information: any ID document not covered above
-"""
-
-# ── VESSEL PROMPT ─────────────────────────────────────────────
-VESSEL_PROMPT = """You are a maritime vessel certificate extraction engine.
-
-CLASSIFICATION SOCIETIES (these go in classification_society ONLY):
-ABS, American Bureau of Shipping, DNV, Det Norske Veritas, Lloyd's Register, LR,
-ClassNK, Nippon Kaiji Kyokai, Bureau Veritas, BV, China Classification Society, CCS,
-RINA, Registro Italiano Navale, Korean Register, KR, Indian Register of Shipping, IRS,
-Polish Register of Shipping, PRS, Croatian Register of Shipping, CRS
-
-ISSUING AUTHORITY = the flag state government, maritime administration, or delegated authority
-that legally issued the certificate (e.g. "Republic of Panama - Maritime Authority",
-"Bahamas Maritime Authority", "Marshall Islands Registry", "UK Maritime and Coastguard Agency").
-A classification society can be a delegated issuing authority for statutory certs - if the cert
-was physically issued by DNV on behalf of a flag state, issuing_authority = flag state,
-classification_society = DNV.
-
-DATE FORMAT: DD-MMM-YYYY. LIFETIME stays as LIFETIME.
-Return ONLY valid JSON, no markdown.
-
-{
-  "is_vessel_document": true,
-  "document_type": "",
-  "vessel_certificate": {
-    "certificate_name": "",
-    "certificate_category": "",
-    "vessel_name": "",
-    "imo_number": "",
-    "certificate_number": "",
-    "cert_type": "",
-    "issuing_authority": "",
-    "classification_society": "",
-    "date_of_issue": "",
-    "date_of_expiry": "",
-    "date_of_survey": ""
-  },
-  "missing_fields": [],
-  "validation_flags": [],
-  "raw_text_summary": ""
-}
-
-certificate_category must be one of: "Class", "Flag State", "Statutory"
-cert_type must be one of: "Interim", "Full Term", "Short Term"
-"""
-
-# ── RESUME PROMPT ─────────────────────────────────────────────
-RESUME_PROMPT = """You are SeaBotics.ai - maritime crew ERP document extraction engine for CVs and resumes.
-
-CRITICAL DISTINCTION - read carefully:
-- licenses_certifications = Official legal documents issued by a maritime authority granting rank/qualification to work.
-  Examples: Certificate of Competency (CoC), Certificate of Proficiency (CoP), GMDSS General Operator Certificate,
-  Flag Endorsements, STCW Endorsements. These have an issuing authority (MARINA, MCA, flag state).
-- courses = Training classes attended at a training centre. These prove attendance, not legal qualification.
-  Examples: Basic Safety Training, ECDIS course, Advanced Fire Fighting, ARPA, crowd management.
-  These are issued by training institutions, not maritime authorities.
-  Rule: if it sounds like a class you attended at a school/centre, it is a course.
-  Rule: if it is a government/authority issued document granting you the right to work at a rank, it is a license.
-
-DATE FORMAT: DD-MMM-YYYY. LIFETIME stays as LIFETIME.
-Return ONLY valid JSON, no markdown.
-
-{
-  "document_type": "",
-  "is_vessel_document": false,
-  "is_resume": true,
-  "personal": {
-    "full_name":"","surname":"","email":"","gender":"","contact_number":"",
-    "date_of_birth":"","nationality":"","blood_group":"","current_rank":"",
-    "identification_mark":"","availability_date":"","address":"","country":"",
-    "state":"","zip_code":"","domestic_airport":"","international_airport":"",
-    "passport_number":"","cdc_number":"","height":"","weight":"",
-    "boiler_suit_size":"","safety_shoe_size":"","shirt_size":"","trouser_size":""
-  },
-  "sea_service": [{"company":"","rank":"","vessel_name":"","vessel_type":"","voyage_type":"","imo_number":"","flag_country":"","grt":"","dwt":"","bhp":"","main_engine_type":"","main_engine_kw":"","sign_on_port":"","sign_off_port":"","start_date":"","end_date":"","reason_sign_off":""}],
-  "travel_documents": [{"document_type":"","document_name":"","certificate_number":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
-  "medical": [{"document_type":"","document_name":"","certificate_number":"","date_of_issue":"","date_of_expiry":""}],
-  "education": [{"institution_name":"","country":"","education_level":"","field_of_study":"","start_date":"","completion_date":""}],
-  "courses": [{"document_name":"","certificate_number":"","type":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
-  "licenses_certifications": [{"document_name":"","certificate_number":"","type":"","issuing_authority":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
-  "bank_details": [{"bank_name":"","branch_name":"","account_type":"","account_name":"","account_number":"","ifsc_swift":""}],
-  "missing_fields":[],
-  "validation_flags":[],
-  "raw_text_summary":""
-}"""
-
-# ── SECTION-SPECIFIC PROMPTS ──────────────────────────────────
-SECTION_PROMPTS = {
-
-"Medical": """You are a maritime medical document extractor.
-Extract medical certificate / vaccination / test data. Also extract any personal info found.
-DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
-{
-  "document_type": "",
-  "personal": {"full_name":"","date_of_birth":"","nationality":"","passport_number":"","cdc_number":""},
-  "medical": [{"document_type":"","document_name":"","certificate_number":"","date_of_issue":"","date_of_expiry":""}],
-  "missing_fields":[]
-}
-document_type must be one of: "Medical Test","Vaccination"
-document_name examples: "PEME - Pre-Employment Medical Examination","D&A - Drug & Alcohol Test","Yellow Fever","COVID 19"
-""",
-
-"Travel Documents": """You are a maritime travel document extractor.
-Extract passport, CDC, seaman's book, visa, and similar documents. Also extract any personal info found.
-DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
-{
-  "document_type": "",
-  "personal": {"full_name":"","surname":"","date_of_birth":"","nationality":"","gender":"","blood_group":"","current_rank":"","address":"","country":"","state":"","zip_code":"","domestic_airport":"","international_airport":""},
-  "travel_documents": [{"document_type":"","document_name":"","certificate_number":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
-  "missing_fields":[]
-}
-document_type examples: "Passport","CDC","Seaman's Book","Visa","Yellow Fever Card"
-""",
-
-"Licenses and Certification": """You are a maritime licensing document extractor.
-Extract Certificate of Competency, Certificate of Proficiency, Endorsements, Flag Endorsements.
-Also extract any personal info found.
-DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
-{
-  "document_type": "",
-  "personal": {"full_name":"","date_of_birth":"","nationality":"","cdc_number":"","current_rank":""},
-  "licenses_certifications": [{"document_name":"","certificate_number":"","type":"","issuing_authority":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
-  "missing_fields":[]
-}
-type must be one of: "STCW - CERTIFICATE OF COMPETENCY","STCW - CERTIFICATE OF PROFICIENCY","STCW - ENDORSMENT","FLAG - FLAG ENDORSEMENT"
-""",
-
-"Courses": """You are a maritime training course document extractor.
-Extract STCW training, value-added courses, refresher courses, basic safety training.
-Also extract any personal info found.
-DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
-{
-  "document_type": "",
-  "personal": {"full_name":"","date_of_birth":"","nationality":""},
-  "courses": [{"document_name":"","certificate_number":"","type":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
-  "missing_fields":[]
-}
-type must be one of: "STCW","FLAG Endorsement","Value Added","Other"
-""",
-
-"Education": """You are an education document extractor for maritime crew profiles.
-Extract degrees, diplomas, school/college certificates. Also extract any personal info found.
-DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
-{
-  "document_type": "",
-  "personal": {"full_name":"","date_of_birth":"","nationality":""},
-  "education": [{"institution_name":"","country":"","education_level":"","field_of_study":"","start_date":"","completion_date":""}],
-  "missing_fields":[]
-}
-""",
-
-"Sea Service Experience": """You are a maritime sea service record extractor.
-Extract employment/discharge records, sea service letters, vessel history.
-Also extract any personal info found.
-DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
-{
-  "document_type": "",
-  "personal": {"full_name":"","cdc_number":"","current_rank":""},
-  "sea_service": [{"company":"","rank":"","vessel_name":"","vessel_type":"","voyage_type":"","imo_number":"","flag_country":"","grt":"","dwt":"","bhp":"","main_engine_type":"","main_engine_kw":"","sign_on_port":"","sign_off_port":"","start_date":"","end_date":"","reason_sign_off":""}],
-  "missing_fields":[]
-}
-vessel_type must be one of: "BULK CARRIER","CHEMICAL TANKER","CONTAINER SHIP","CRUISE SHIP","GAS CARRIER","GENERAL CARGO SHIP","LIVESTOCK CARRIER","OIL TANKER","RO-RO SHIP","TUGBOAT"
-voyage_type must be one of: "Foreign Going","Near Coastal","Coastal","Home Trade"
-""",
-
-"Bank Details": """You are a bank details extractor for maritime crew profiles.
-Extract bank account information. Also extract any personal info found.
-DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
-{
-  "document_type": "",
-  "personal": {"full_name":"","nationality":""},
-  "bank_details": [{"bank_name":"","branch_name":"","account_type":"","account_name":"","account_number":"","ifsc_swift":""}],
-  "missing_fields":[]
-}
-""",
-
-"Personal Information": """You are a personal information extractor for maritime crew profiles.
-Extract all personal/identity details from any ID document.
-DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
-{
-  "document_type": "",
-  "personal": {
-    "full_name":"","surname":"","email":"","gender":"","contact_number":"",
-    "date_of_birth":"","nationality":"","blood_group":"","current_rank":"",
-    "identification_mark":"","availability_date":"","address":"","country":"",
-    "state":"","zip_code":"","domestic_airport":"","international_airport":"",
-    "passport_number":"","cdc_number":"","height":"","weight":"",
-    "boiler_suit_size":"","safety_shoe_size":"","shirt_size":"","trouser_size":""
-  },
-  "missing_fields":[]
-}
-""",
-}
-
-IMAGE_EXT = {".png",".jpg",".jpeg",".tiff",".bmp",".webp"}
-
-def preprocess(img):
-    if img.mode != "RGB": img = img.convert("RGB")
-    w,h = img.size
-    if w < 1000: img = img.resize((1000,int(h*1000/w)),Image.LANCZOS)
-    img = img.filter(ImageFilter.SHARPEN)
-    img = ImageEnhance.Contrast(img).enhance(1.5)
-    return img.convert("L")
-
-def extract_text(path):
-    ext = Path(path).suffix.lower()
-    if ext in IMAGE_EXT:
-        img = preprocess(Image.open(path))
-        return max([pytesseract.image_to_string(img,config=c) for c in ["--psm 3","--psm 6","--psm 11"]],key=len)
-    if ext == ".pdf":
-        doc = fitz.open(path); pages=[]
-        for p in doc:
-            t = p.get_text("text").strip()
-            if len(t)>50: pages.append(t)
-            else:
-                pix=p.get_pixmap(dpi=250)
-                img=preprocess(Image.frombytes("RGB",[pix.width,pix.height],pix.samples))
-                pages.append(pytesseract.image_to_string(img))
-        doc.close(); return "\n--- PAGE BREAK ---\n".join(pages)
-    if ext==".docx": return "\n".join(p.text for p in DocxDocument(path).paragraphs if p.text.strip())
-    if ext==".txt":
-        with open(path) as f: return f.read()
-    if ext in [".xlsx",".xls"]:
-        wb=openpyxl.load_workbook(path,data_only=True)
-        return "\n".join("  |  ".join(str(c) for c in r if c) for s in wb.worksheets for r in s.iter_rows(values_only=True))
-    raise ValueError(f"Unsupported: {ext}")
-
-def _llm_call(system_prompt, user_text, max_tokens=4000, text_limit=12000):
-    """Core LLM caller - shared by all pipelines."""
-    client = Groq(api_key=GROQ_API_KEY)
-    if len(user_text) > text_limit:
-        user_text = user_text[:text_limit]
-    if not user_text.strip():
-        return None
-    for attempt in range(3):
-        try:
-            r = client.chat.completions.create(
-                model=MODEL_NAME, temperature=0.1, max_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": f"Extract all information:\n\n{user_text}"}
-                ])
-            raw = r.choices[0].message.content.strip()
-            if not raw: continue
-            raw = re.sub(r"^```[a-z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
-            start = raw.find("{"); end = raw.rfind("}") + 1
-            if start == -1 or end == 0: continue
-            return json.loads(raw[start:end])
-        except json.JSONDecodeError:
-            continue
-        except Exception as e:
-            st.error(f"API error: {e}"); return None
-    st.error("Pipeline failed after 3 attempts.")
-    return None
-
-
-def classify_document(text):
-    """Step 1 for Master Upload - lightweight classifier, ~200 tokens."""
-    # Only feed first 3000 chars to classifier - enough to identify doc type
-    # saves TPM and avoids rate limit on the classify call
-    return _llm_call(CLASSIFIER_PROMPT, text, max_tokens=200, text_limit=3000)
-
-
-def call_llm(text, target_section=None, is_vessel=False, is_resume=False):
-    """
-    Unified entry point.
-    - target_section set  -> use section-specific prompt (1 call)
-    - is_vessel = True    -> use vessel prompt (1 call)
-    - is_resume = True    -> use resume prompt (1 call)
-    - all None/False      -> full resume prompt as fallback
-    """
-    if is_vessel:
-        return _llm_call(VESSEL_PROMPT, text, max_tokens=1500)
-    if is_resume:
-        # Resume gets more text but still capped to avoid TPM breach on Groq free tier
-        # 8000 chars ~ 2000 tokens input, well within 6000 TPM limit
-        return _llm_call(RESUME_PROMPT, text, max_tokens=5000, text_limit=8000)
-    if target_section and target_section in SECTION_PROMPTS:
-        return _llm_call(SECTION_PROMPTS[target_section], text, max_tokens=2000)
-    # fallback - treat as resume/full extract
-    return _llm_call(RESUME_PROMPT, text, max_tokens=5000)
+# ── UI HELPERS ────────────────────────────────────────────────
 
 def conf_color(c):
-    if c>=0.90: return "#22c55e"
-    if c>=0.60: return "#f59e0b"
-    if c>0.00:  return "#ef4444"
+    if c >= 0.90: return "#22c55e"
+    if c >= 0.60: return "#f59e0b"
+    if c > 0.00:  return "#ef4444"
     return "#e2e8f0"
 
-def field_coherence(field_label, value):
-    """Return 0.0-1.0 coherence score for a free-text value given its field label."""
-    if not value:
-        return 0.0
-    v    = value.strip()
-    fl   = field_label.lower()
-    _len = max(len(v), 1)
-    # Name fields: only letters, spaces, hyphens, apostrophes, dots
-    if fl in ("full name", "surname"):
-        valid = len(re.findall(r"[a-zA-Z \-\.\']", v))
-        return round(valid / _len, 2)
-    # Numeric fields
-    if fl in ("height", "weight"):
-        return 1.0 if re.match(r"^\d+(\.\d+)?\s*(cm|kg|lbs?|m)?$", v, re.IGNORECASE) else 0.3
-    # Email
-    if fl == "email":
-        return 1.0 if re.match(r"^[\w.+\-]+@[\w\-]+\.[\w.]+$", v) else 0.2
-    # Phone
-    if fl == "contact number":
-        valid = len(re.findall(r"[\d\+\-\(\) ]", v))
-        return round(min(1.0, valid / _len), 2)
-    # Document ID numbers
-    if fl in ("passport number", "cdc / seaman's book number"):
-        valid = len(re.findall(r"[a-zA-Z0-9\-\/]", v))
-        return round(min(1.0, valid / _len), 2)
-    # Mostly-alpha fields
-    if fl in ("nationality", "country", "state", "address"):
-        valid = len(re.findall(r"[a-zA-Z0-9 \-\/\.,]", v))
-        return round(min(1.0, valid / _len), 2)
-    # Date fields - defer to validate_field_value flag
-    if "date" in fl:
-        _, flag = validate_field_value(field_label, v)
-        return 0.7 if flag else 1.0
-    # General: penalise obviously junk characters ($#@!%^&*)
-    bad = len(re.findall(r"[$#@!%^&*=|<>~`]", v))
-    if bad == 0:
-        return 1.0
-    return max(0.1, round(1.0 - (bad / _len) * 3, 2))
 
 def render_field_alerts(issues):
     """Render a compact inline badge strip summarising field issues.
@@ -831,195 +113,9 @@ def render_field_alerts(issues):
         unsafe_allow_html=True
     )
 
-DATE_PATTERN = re.compile(
-    r"^\d{1,2}-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{4}$",
-    re.IGNORECASE
-)
-
-VALID_GENDERS = {"male", "female", "m", "f", "other"}
-
-def validate_field_value(col_name, value):
-    """
-    Returns (confidence_penalty, flag_message) for illogical or malformed values.
-    confidence_penalty is subtracted from base confidence (0.0 = no issue).
-    """
-    if not value or not value.strip():
-        return 0.0, None
-
-    v = value.strip()
-    col_lower = col_name.lower()
-
-    # Date fields
-    if "date" in col_lower:
-        if v.upper() == "LIFETIME":
-            return 0.0, None
-        if not DATE_PATTERN.match(v):
-            return 0.3, f"{col_name}: '{v}' is not in DD-MMM-YYYY format"
-
-    # Gender field
-    if col_lower == "gender":
-        if v.lower() not in VALID_GENDERS:
-            return 0.3, f"Gender: '{v}' is not a recognised value (expected Male/Female)"
-
-    # Numeric fields that should not contain letters
-    if col_lower in {"grt","dwt","bhp","main engine kw","height","weight"}:
-        clean = v.replace(",","").replace(".","").replace(" ","")
-        if not clean.isdigit():
-            return 0.2, f"{col_name}: '{v}' expected a numeric value"
-
-    # Certificate/document numbers that are suspiciously short
-    if "certificate number" in col_lower or "account number" in col_lower:
-        if len(v) < 3:
-            return 0.2, f"{col_name}: '{v}' seems too short to be valid"
-
-    return 0.0, None
-
-def check_dropdown_validity(section, field_name, value):
-    """Returns True if value is valid for dropdown field, False if invalid"""
-    drops = DROPDOWN_FIELDS.get(section,{})
-    if field_name not in drops: return True  # not a dropdown field
-    valid_options = drops[field_name]
-    return any(value.strip().upper() == opt.upper() for opt in valid_options)
-
-def get_dropdown_options(section, field_name):
-    drops = DROPDOWN_FIELDS.get(section,{})
-    return drops.get(field_name, [])
-
-def personal_to_profile(p):
-    m = {"full_name":"Full Name","surname":"Surname","email":"Email Address",
-         "gender":"Gender","contact_number":"Phone Number","date_of_birth":"Date of Birth",
-         "nationality":"Nationality","blood_group":"Blood Group","current_rank":"Rank / Designation",
-         "identification_mark":"Identification Mark","availability_date":"Availability Date",
-         "address":"Residential Address","country":"Country","state":"State",
-         "zip_code":"ZIP / PIN Code","domestic_airport":"Domestic Airport",
-         "international_airport":"International Airport","passport_number":"Passport Number",
-         "cdc_number":"CDC / Seaman's Book Number","height":"Height","weight":"Weight",
-         "boiler_suit_size":"Boiler Suit Size","safety_shoe_size":"Safety Shoe Size",
-         "shirt_size":"Shirt Size","trouser_size":"Trouser Size"}
-    return {v:p[k] for k,v in m.items() if p.get(k)}
-
-def result_to_rows(result):
-    rows={s:[] for s in SECTION_COLUMNS}
-    for e in result.get("sea_service",[]):
-        if any(v for v in e.values()):
-            rows["Sea Service Experience"].append({
-                "Company":e.get("company",""),"Rank":e.get("rank",""),
-                "Vessel Name":e.get("vessel_name",""),"Vessel Type":e.get("vessel_type",""),
-                "Voyage Type":e.get("voyage_type",""),"IMO Number":e.get("imo_number",""),
-                "Flag / Country":e.get("flag_country",""),"GRT":e.get("grt",""),
-                "DWT":e.get("dwt",""),"BHP":e.get("bhp",""),
-                "Main Engine Type":e.get("main_engine_type",""),
-                "Main Engine KW":e.get("main_engine_kw",""),
-                "Sign On Port":e.get("sign_on_port",""),"Sign Off Port":e.get("sign_off_port",""),
-                "Start Date":e.get("start_date",""),"End Date":e.get("end_date",""),
-                "Reason for Sign Off":e.get("reason_sign_off",""),
-            })
-    for e in result.get("travel_documents",[]):
-        if any(v for v in e.values()):
-            rows["Travel Documents"].append({
-                "Document Type":e.get("document_type",""),"Document Name":e.get("document_name",""),
-                "Certificate Number":e.get("certificate_number",""),
-                "Place of Issue":e.get("place_of_issue",""),
-                "Date of Issue":e.get("date_of_issue",""),"Date of Expiry":e.get("date_of_expiry",""),
-            })
-    for e in result.get("medical",[]):
-        if any(v for v in e.values()):
-            rows["Medical"].append({
-                "Document Type":e.get("document_type",""),"Document Name":e.get("document_name",""),
-                "Certificate Number":e.get("certificate_number",""),
-                "Date of Issue":e.get("date_of_issue",""),"Date of Expiry":e.get("date_of_expiry",""),
-            })
-    for e in result.get("education",[]):
-        if any(v for v in e.values()):
-            rows["Education"].append({
-                "Institution Name":e.get("institution_name",""),"Country":e.get("country",""),
-                "Level of Education":e.get("education_level",""),
-                "Field of Study":e.get("field_of_study",""),
-                "Start Date":e.get("start_date",""),"Completion Date":e.get("completion_date",""),
-            })
-    for e in result.get("courses",[]):
-        if any(v for v in e.values()):
-            rows["Courses"].append({
-                "Document Name":e.get("document_name",""),
-                "Certificate Number":e.get("certificate_number",""),
-                "Type":e.get("type",""),"Place of Issue":e.get("place_of_issue",""),
-                "Date of Issue":e.get("date_of_issue",""),"Date of Expiry":e.get("date_of_expiry",""),
-            })
-    for e in result.get("licenses_certifications",[]):
-        if any(v for v in e.values()):
-            rows["Licenses and Certification"].append({
-                "Document Name":e.get("document_name",""),
-                "Certificate Number":e.get("certificate_number",""),
-                "Type":e.get("type",""),"Issuing Authority":e.get("issuing_authority",""),
-                "Place of Issue":e.get("place_of_issue",""),
-                "Date of Issue":e.get("date_of_issue",""),"Date of Expiry":e.get("date_of_expiry",""),
-            })
-    for e in result.get("bank_details",[]):
-        if any(v for v in e.values()):
-            rows["Bank Details"].append({
-                "Bank Name":e.get("bank_name",""),"Branch Name":e.get("branch_name",""),
-                "Account Type":e.get("account_type",""),"Account Name":e.get("account_name",""),
-                "Account Number":e.get("account_number",""),"IFSC / SWIFT Code":e.get("ifsc_swift",""),
-            })
-    rows = reclassify_courses_and_licenses(rows)
-    return rows
-
-# Map cert name to category
-CERT_NAME_TO_CATEGORY = {}
-for cat, names in VESSEL_CERT_CATEGORIES.items():
-    for name in names:
-        CERT_NAME_TO_CATEGORY[name.upper()] = cat
-
-def infer_cert_category(cert_name):
-    if not cert_name: return ""
-    matched = fuzzy_match_dropdown(cert_name, ALL_VESSEL_NAMES)
-    if matched:
-        return CERT_NAME_TO_CATEGORY.get(matched.upper(), "")
-    return ""
-
-def infer_cert_type(raw_type):
-    if not raw_type: return "Full Term"
-    rt = raw_type.upper()
-    if "INTERIM" in rt: return "Interim"
-    if "SHORT" in rt:   return "Short Term"
-    return "Full Term"
-
-def infer_issuing_authority(raw_text, cert_category, classification_society):
-    """Issuing authority logic per category."""
-    if cert_category == "Class":
-        return classification_society or raw_text
-    if cert_category == "Flag State":
-        return raw_text  # flag state authority or delegated firm like DNV
-    if cert_category == "Statutory":
-        return raw_text  # flag state maritime authority or RO
-    return raw_text
-
-def vessel_result_to_row(result):
-    vc = result.get("vessel_certificate",{})
-    if not vc or not any(v for v in vc.values()): return None
-
-    cert_name_raw  = vc.get("certificate_name","")
-    cert_name_fuzzy = fuzzy_match_dropdown(cert_name_raw, ALL_VESSEL_NAMES) or cert_name_raw
-    cert_category  = infer_cert_category(cert_name_raw) or vc.get("certificate_category","")
-    cert_type      = infer_cert_type(vc.get("cert_type",""))
-    class_society  = vc.get("classification_society","")
-    issuing_auth   = infer_issuing_authority(vc.get("issuing_authority",""), cert_category, class_society)
-
-    return {
-        "Certificate Name":       cert_name_fuzzy,
-        "Certificate Category":   cert_category,
-        "Vessel":                 vc.get("vessel_name",""),
-        "IMO Number":             vc.get("imo_number",""),
-        "Certificate Number":     vc.get("certificate_number",""),
-        "Type":                   cert_type,
-        "Issuing Authority":      issuing_auth,
-        "Classification Society": class_society,
-        "Date of Issue":          vc.get("date_of_issue",""),
-        "Date of Expiry":         vc.get("date_of_expiry",""),
-        "Date of Survey":         vc.get("date_of_survey",""),
-    }
 
 # ── GRID CARD DISPLAY ─────────────────────────────────────────
+
 def render_section_content(section_name, rows, key_prefix, view_mode="grid"):
     """Render section rows as grid cards or table, with full data visible."""
     cols_def = SECTION_COLUMNS.get(section_name, VESSEL_COLUMNS)
@@ -1031,17 +127,13 @@ def render_section_content(section_name, rows, key_prefix, view_mode="grid"):
 
     if view_mode == "table":
         cols_def = SECTION_COLUMNS.get(section_name, VESSEL_COLUMNS)
-        # Build clean dataframe
         df = pd.DataFrame(rows)
         for c in cols_def:
             if c not in df.columns:
                 df[c] = ""
         df = df[cols_def].fillna("")
-
-        # Read-only table view
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        # Grid card view - show ALL fields in card
         for i in range(0, len(rows), 2):
             card_cols = st.columns(2)
             for j in range(2):
@@ -1052,7 +144,6 @@ def render_section_content(section_name, rows, key_prefix, view_mode="grid"):
                     title_val = next((row.get(f,"") for f in ["Document Name","Certificate Name","Company","Institution Name","Bank Name","Vessel"] if row.get(f)), f"Record {idx+1}")
                     invalid_fields = [cn for cn,val in row.items() if val and cn in drops and not check_dropdown_validity(section_name,cn,val)]
 
-                    # Build all field lines for card body
                     field_lines = "".join([
                         f'<div style="margin-bottom:3px;"><span style="font-size:0.65rem;color:#94a3b8;text-transform:uppercase;">{cn}:</span> <span style="font-size:0.78rem;color:#1e293b;font-weight:500;">{val}</span></div>'
                         for cn, val in row.items() if val
@@ -1067,66 +158,43 @@ def render_section_content(section_name, rows, key_prefix, view_mode="grid"):
                     </div>
                     """, unsafe_allow_html=True)
 
-# ── SUB-POPUP (edit individual record) ───────────────────────
-ALL_ORG_OPTIONS = sorted(set([
-    "Full Name","Surname","Email Address","Gender","Phone Number","Date of Birth",
-    "Nationality","Blood Group","Rank / Designation","Identification Mark",
-    "Availability Date","Residential Address","Country","State","ZIP / PIN Code",
-    "Domestic Airport","International Airport","Passport Number",
-    "CDC / Seaman's Book Number","Height","Weight","Boiler Suit Size",
-    "Safety Shoe Size","Shirt Size","Trouser Size","Document Type","Document Name",
-    "Document / Certificate Number","Issuing Authority","Place of Issue",
-    "Date of Issue","Date of Expiry","Institution Name","Level of Education",
-    "Field of Study","Start Date","Completion Date","Bank Name","Branch Name",
-    "Account Type","Account Name","Account Number","IFSC / SWIFT Code",
-    "Company Name","IMO Number","Vessel Name","Vessel Type","Flag State",
-    "Voyage Type","Sign On Port","Sign Off Port","GRT","DWT","BHP",
-    "Main Engine Type / Model","Main Engine KW","Reason for Sign Off",
-    "Certificate Name","Certificate Category","Classification Society",
-    "Date of Survey","Other / Unclassified"
-]))
 
-ORG_PREMAP = {
-    "Document Name": "Document Name",
-    "Document Type": "Document Type",
-    "Certificate Number": "Document / Certificate Number",
-    "Date of Issue": "Date of Issue",
-    "Date of Expiry": "Date of Expiry",
-    "Place of Issue": "Place of Issue",
-    "Issuing Authority": "Issuing Authority",
-    "Type": "Document Type",
-    "Company": "Company Name",
-    "Rank": "Rank / Designation",
-    "Vessel Name": "Vessel Name",
-    "Vessel Type": "Vessel Type",
-    "Voyage Type": "Voyage Type",
-    "IMO Number": "IMO Number",
-    "Flag / Country": "Flag State",
-    "GRT": "GRT", "DWT": "DWT", "BHP": "BHP",
-    "Main Engine Type": "Main Engine Type / Model",
-    "Main Engine KW": "Main Engine KW",
-    "Sign On Port": "Sign On Port",
-    "Sign Off Port": "Sign Off Port",
-    "Start Date": "Start Date",
-    "End Date": "Sign Off Date",
-    "Reason for Sign Off": "Reason for Sign Off",
-    "Institution Name": "Institution Name",
-    "Level of Education": "Level of Education",
-    "Field of Study": "Field of Study",
-    "Completion Date": "Completion Date",
-    "Country": "Country",
-    "Bank Name": "Bank Name",
-    "Branch Name": "Branch Name",
-    "Account Type": "Account Type",
-    "Account Name": "Account Name",
-    "Account Number": "Account Number",
-    "IFSC / SWIFT Code": "IFSC / SWIFT Code",
-    "Certificate Name": "Certificate Name",
-    "Certificate Category": "Certificate Category",
-    "Vessel": "Vessel Name",
-    "Classification Society": "Classification Society",
-    "Date of Survey": "Date of Survey",
-}
+# ── APPROVE AND POPULATE ──────────────────────────────────────
+
+def approve_and_populate(result, is_vessel, pending_rows, pending_vessel, personal, selected_sections=None):
+    """
+    Shared approval logic. Fills empty fields only - skips already populated ones.
+    selected_sections: set of section names to populate. None = all sections.
+    """
+    if is_vessel:
+        if selected_sections is None or "Vessels" in selected_sections:
+            if pending_vessel and any(v for v in pending_vessel.values()):
+                st.session_state["vessels"].append(pending_vessel)
+    else:
+        if selected_sections is None or "Personal Information" in selected_sections:
+            profile_data = personal_to_profile(personal)
+            for k, v in profile_data.items():
+                if v and not st.session_state["profile"].get(k):
+                    st.session_state["profile"][k] = v
+
+            for td in pending_rows.get("Travel Documents", []):
+                dt = (td.get("Document Type","") + td.get("Document Name","")).lower()
+                if "passport" in dt and td.get("Certificate Number"):
+                    if not st.session_state["profile"].get("Passport Number"):
+                        st.session_state["profile"]["Passport Number"] = td["Certificate Number"]
+                if ("cdc" in dt or "seaman" in dt) and td.get("Certificate Number"):
+                    if not st.session_state["profile"].get("CDC / Seaman's Book Number"):
+                        st.session_state["profile"]["CDC / Seaman's Book Number"] = td["Certificate Number"]
+
+        for section, rows in pending_rows.items():
+            if selected_sections is not None and section not in selected_sections:
+                continue
+            for row in rows:
+                if any(v for v in row.values()):
+                    st.session_state["sections"][section].append(row)
+
+
+# ── SUB-POPUP (edit individual record) ───────────────────────
 
 def render_subpopup():
     sp = st.session_state.get("subpopup")
@@ -1145,7 +213,6 @@ def render_subpopup():
     with st.expander(f"Edit Record - {section}", expanded=True):
         st.markdown(f'<div class="section-label">Editing record {row_idx+1} in {section}</div>', unsafe_allow_html=True)
 
-        # Field alert strip for this row
         _sp_issues = []
         for _sp_col in cols_def:
             _sp_v = row.get(_sp_col, "") or ""
@@ -1188,7 +255,6 @@ def render_subpopup():
                 if matched:
                     fuzzy_val = matched
 
-            # Live confidence: read current widget value from session state
             _sp_wkey = f"v_sp_{key}_{col_name}"
             _sp_cur  = st.session_state.get(_sp_wkey, fuzzy_val)
             if _sp_cur == "- Select -":
@@ -1276,10 +342,8 @@ def render_subpopup():
             if st.button("Save Changes", type="primary", use_container_width=True, key=f"save_sp_{key}"):
                 source = st.session_state["subpopup"].get("source", "profile")
                 if source == "personal":
-                    # Write back to profile using PERSONAL_FIELDS label as key
                     for fk, fl in PERSONAL_FIELDS:
                         if fl in edited_row:
-                            org_key = {fl2: fk for fk2, fl2 in PERSONAL_FIELDS}.get(fl, fl)
                             ORG_MAP_INV = {
                                 "Full Name":"Full Name","Surname":"Surname",
                                 "Email":"Email Address","Gender":"Gender",
@@ -1322,39 +386,8 @@ def render_subpopup():
                 st.session_state["subpopup"] = None
                 st.rerun()
 
+
 # ── MAIN POPUP (after upload) ─────────────────────────────────
-def approve_and_populate(result, is_vessel, pending_rows, pending_vessel, personal, selected_sections=None):
-    """
-    Shared approval logic. Fills empty fields only - skips already populated ones.
-    selected_sections: set of section names to populate. None = all sections.
-    """
-    if is_vessel:
-        if selected_sections is None or "Vessels" in selected_sections:
-            if pending_vessel and any(v for v in pending_vessel.values()):
-                st.session_state["vessels"].append(pending_vessel)
-    else:
-        if selected_sections is None or "Personal Information" in selected_sections:
-            profile_data = personal_to_profile(personal)
-            for k, v in profile_data.items():
-                # Only fill if field is currently empty
-                if v and not st.session_state["profile"].get(k):
-                    st.session_state["profile"][k] = v
-
-            for td in pending_rows.get("Travel Documents", []):
-                dt = (td.get("Document Type","") + td.get("Document Name","")).lower()
-                if "passport" in dt and td.get("Certificate Number"):
-                    if not st.session_state["profile"].get("Passport Number"):
-                        st.session_state["profile"]["Passport Number"] = td["Certificate Number"]
-                if ("cdc" in dt or "seaman" in dt) and td.get("Certificate Number"):
-                    if not st.session_state["profile"].get("CDC / Seaman's Book Number"):
-                        st.session_state["profile"]["CDC / Seaman's Book Number"] = td["Certificate Number"]
-
-        for section, rows in pending_rows.items():
-            if selected_sections is not None and section not in selected_sections:
-                continue
-            for row in rows:
-                if any(v for v in row.values()):
-                    st.session_state["sections"][section].append(row)
 
 def render_popup():
     popup = st.session_state.get("popup")
@@ -1369,7 +402,6 @@ def render_popup():
     missing   = result.get("missing_fields", [])
     flags     = result.get("validation_flags", [])
 
-    # Build pending rows once; reset section nav on each new popup
     if "pending_rows" not in popup:
         _draft_state = popup.get("draft_state")
         if _draft_state:
@@ -1383,11 +415,9 @@ def render_popup():
         st.session_state["popup"] = popup
         st.session_state["popup_active_section"] = None
         st.session_state["popup_discard_confirm"] = False
-        # Flush widget keys from any previous popup to prevent stale confidence scores
         for _wk in list(st.session_state.keys()):
             if _wk.startswith(("pp_popup_", "vc_popup_", "v_sp_")):
                 del st.session_state[_wk]
-        # Initialise section selections - all True by default
         _init_sel = {}
         if is_vessel:
             _init_sel["Vessels"] = True
@@ -1403,7 +433,6 @@ def render_popup():
     pending_vessel = popup.get("pending_vessel")
     _dt_approved   = (popup.get("source") == "doc_tank" and popup.get("tank_status", "") in ("Approved", "Partial"))
 
-    # Count low-confidence fields in one section row
     def _row_low_conf(section_name, row):
         drops = DROPDOWN_FIELDS.get(section_name, {})
         count = 0
@@ -1418,7 +447,6 @@ def render_popup():
                 count += 1
         return count
 
-    # Count personal fields that fail format validation
     def _personal_low_conf():
         count = 0
         for k, v in personal.items():
@@ -1431,7 +459,6 @@ def render_popup():
 
     with st.expander(f"Review & Approve - {filename}", expanded=True):
 
-        # Doc tank status banner
         if popup.get("source") == "doc_tank":
             tank_status = popup.get("tank_status", "Pending")
             if tank_status == "Approved":
@@ -1446,7 +473,7 @@ def render_popup():
 
         st.markdown("---")
 
-        # ── VESSEL FLOW: inline editable confidence table ─────
+        # ── VESSEL FLOW ───────────────────────────────────────
         if is_vessel and pending_vessel:
             if not _dt_approved:
                 _vsl_chk = st.checkbox(
@@ -1475,7 +502,6 @@ def render_popup():
                     _vc_pm = fuzzy_match_dropdown(_vc_val, _vc_drop_opts)
                     if _vc_pm:
                         _vc_matched = _vc_pm
-                # Live confidence: read current widget value from session state
                 _vc_wkey = f"vc_popup_{_vc_col}"
                 _vc_cur  = st.session_state.get(_vc_wkey, _vc_matched)
                 if _vc_cur == "- Select -":
@@ -1549,11 +575,10 @@ def render_popup():
                     st.selectbox(f"o_vc_{_vc_col}", options=_vc_org_opts, index=_vc_org_idx,
                                  key=f"o_vc_popup_{_vc_col}", label_visibility="collapsed")
 
-        # ── CREW FLOW: section card overview + drill-in ───────
+        # ── CREW FLOW ─────────────────────────────────────────
         if not is_vessel:
             active_sec = st.session_state.get("popup_active_section")
 
-            # ── OVERVIEW: one card per section that has data ──
             if active_sec is None:
                 _sel_state = st.session_state.get("popup_section_selections", {})
                 show_personal = any(v for v in personal.values())
@@ -1614,7 +639,6 @@ def render_popup():
                             st.session_state["popup_active_section"] = section_name
                             st.rerun()
 
-            # ── PERSONAL INFO DRILL-IN ────────────────────────
             elif active_sec == "Personal Information":
                 if st.button("< Back", key="popup_back_personal"):
                     st.session_state["popup_active_section"] = None
@@ -1623,7 +647,6 @@ def render_popup():
                 if popup.get("source") == "section":
                     st.info("Personal info found in this document - review below before approving.")
                 if _dt_approved:
-                    # Read-only display for approved documents
                     _PK_RO = {"person_name": "full_name", "rank": "current_rank"}
                     _ro_items = [(fl, personal.get(_PK_RO.get(fk, fk), "") or "") for fk, fl in PERSONAL_FIELDS]
                     _filled = [(fl, v) for fl, v in _ro_items if v]
@@ -1639,7 +662,6 @@ def render_popup():
                                 else:
                                     st.markdown(f'<div class="field-empty">-</div>', unsafe_allow_html=True)
                 else:
-                    # Confidence table header
                     ph1, ph2, ph3, ph4, ph5 = st.columns([2, 2.5, 1.2, 1.2, 2.5])
                     ph1.markdown("**Field**")
                     ph2.markdown("**Value**")
@@ -1647,7 +669,6 @@ def render_popup():
                     ph4.markdown("**Status**")
                     ph5.markdown("**System Fields**")
                     st.markdown("<hr style='margin:4px 0 8px 0;border-color:#e2e8f0;'>", unsafe_allow_html=True)
-                    # LLM returns these under different keys than PERSONAL_FIELDS fk
                     _P_KEY   = {"person_name": "full_name", "rank": "current_rank"}
                     _p_drops = DROPDOWN_FIELDS.get("Personal Information", {})
                     _P_ABBR_MAP = {
@@ -1667,7 +688,6 @@ def render_popup():
                             _pm = fuzzy_match_dropdown(_p_val_pre, _p_drop_opts)
                             if _pm:
                                 _p_matched = _pm
-                        # Live confidence: read current widget value from session state
                         _pp_wkey = f"pp_popup_{_pk}"
                         _pp_cur  = st.session_state.get(_pp_wkey, _p_matched)
                         if _pp_cur == "- Select -":
@@ -1739,7 +759,6 @@ def render_popup():
                             st.selectbox(f"o_pp_{_pk}", options=_pp_org_opts, index=_pp_org_idx,
                                          key=f"o_pp_popup_{_pk}", label_visibility="collapsed")
 
-            # ── SECTION RECORDS DRILL-IN (table view) ────────────
             else:
                 rows     = pending_rows.get(active_sec, [])
                 cols_def = SECTION_COLUMNS.get(active_sec, VESSEL_COLUMNS)
@@ -1809,7 +828,6 @@ def render_popup():
                         _selections   = st.session_state.get("popup_section_selections", {})
                         _selected_set = set(k for k, v in _selections.items() if v)
 
-                        # Resume wipe clears both profile and all crew sections
                         if result.get("is_resume", False) and not is_vessel:
                             st.session_state["profile"] = {}
                             for _wipe_sec in SECTION_COLUMNS:
@@ -1818,7 +836,6 @@ def render_popup():
                         approve_and_populate(result, is_vessel, pending_rows, pending_vessel, personal,
                                              selected_sections=_selected_set if _selected_set else None)
 
-                        # Build approved fields list (only from selected sections)
                         approved_fields = []
                         if not is_vessel:
                             if _selections.get("Personal Information", True):
@@ -1833,7 +850,6 @@ def render_popup():
                             if _selections.get("Vessels", True):
                                 approved_fields += [f"{k}: {v[:30]}" for k, v in pending_vessel.items() if v]
 
-                        # Determine Approved vs Partial
                         _all_available = set()
                         if is_vessel:
                             _all_available.add("Vessels")
@@ -1845,7 +861,6 @@ def render_popup():
                                     _all_available.add(_sn)
                         _final_status = "Approved" if _selected_set >= _all_available else "Partial"
 
-                        # Mark the doc tank entry
                         tank_id = popup.get("tank_id")
                         for dt_entry in st.session_state["doc_tank"]:
                             if dt_entry.get("tank_id") == tank_id:
@@ -1935,6 +950,7 @@ def render_popup():
                     st.session_state["popup_discard_confirm"] = True
                     st.rerun()
 
+
 # ── HEADER ────────────────────────────────────────────────────
 st.markdown("""
 <div style="background:linear-gradient(135deg,#0f172a,#1e3a5f);border-radius:12px;padding:16px 24px;margin-bottom:16px;">
@@ -1964,14 +980,12 @@ elif st.session_state.get("popup"):
 # ════════════════════════════════════════════════════════════
 elif st.session_state["page"] == "Crew":
 
-    # All Crew tabs
     _crew_tabs = st.tabs([
         "Personal Info", "Experience", "Licenses and Certifications",
         "Medical", "Education", "Courses", "Bank Details",
         "Travel Documents", "Doc Check-List", "Travel Details",
     ])
 
-    # Personal Info tab
     with _crew_tabs[0]:
         st.markdown(
             '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
@@ -2018,19 +1032,18 @@ elif st.session_state["page"] == "Crew":
         st.markdown("<hr style='margin:8px 0;border-color:#f1f5f9;'>", unsafe_allow_html=True)
         profile = st.session_state["profile"]
         ORG_MAP = {"person_name":"Full Name","surname":"Surname","email":"Email Address","gender":"Gender","contact_number":"Phone Number","date_of_birth":"Date of Birth","nationality":"Nationality","blood_group":"Blood Group","rank":"Rank / Designation","identification_mark":"Identification Mark","availability_date":"Availability Date","address":"Residential Address","country":"Country","state":"State","zip_code":"ZIP / PIN Code","domestic_airport":"Domestic Airport","international_airport":"International Airport","passport_number":"Passport Number","cdc_number":"CDC / Seaman's Book Number","height":"Height","weight":"Weight","boiler_suit_size":"Boiler Suit Size","safety_shoe_size":"Safety Shoe Size","shirt_size":"Shirt Size","trouser_size":"Trouser Size"}
-        for i in range(0,len(PERSONAL_FIELDS),3):
-            row_f=PERSONAL_FIELDS[i:i+3]; cols=st.columns(3)
-            for j,(fk,fl) in enumerate(row_f):
+        for i in range(0, len(PERSONAL_FIELDS), 3):
+            row_f = PERSONAL_FIELDS[i:i+3]; cols = st.columns(3)
+            for j, (fk, fl) in enumerate(row_f):
                 with cols[j]:
-                    org_key=ORG_MAP.get(fk,fl); val=profile.get(org_key,"")
-                    st.markdown(f'<div class="field-label">{fl}</div>',unsafe_allow_html=True)
-                    if val: st.markdown(f'<div class="field-value">{val}</div>',unsafe_allow_html=True)
-                    else:   st.markdown(f'<div class="field-empty">-</div>',unsafe_allow_html=True)
+                    org_key = ORG_MAP.get(fk, fl); val = profile.get(org_key, "")
+                    st.markdown(f'<div class="field-label">{fl}</div>', unsafe_allow_html=True)
+                    if val: st.markdown(f'<div class="field-value">{val}</div>', unsafe_allow_html=True)
+                    else:   st.markdown(f'<div class="field-empty">-</div>', unsafe_allow_html=True)
         if profile:
             if st.button("Clear Personal Info", key="clear_personal"):
                 st.session_state["profile"] = {}; st.rerun()
 
-    # Multi-row sections - ordered display list (internal key, display label)
     _CREW_ORDER = [
         ("Sea Service Experience",     "Experience"),
         ("Licenses and Certification", "Licenses and Certifications"),
@@ -2042,14 +1055,13 @@ elif st.session_state["page"] == "Crew":
     ]
     for (section_name, display_name), _tab_sec in zip(_CREW_ORDER, _crew_tabs[1:8]):
         cols_def = SECTION_COLUMNS[section_name]
-        rows=st.session_state["sections"].get(section_name,[])
+        rows = st.session_state["sections"].get(section_name, [])
         with _tab_sec:
             st.markdown(
                 f'<div style="font-size:0.8rem;color:#64748b;margin-bottom:8px;">'
                 f'{len(rows)} record{"s" if len(rows)!=1 else ""}</div>',
                 unsafe_allow_html=True
             )
-            # Top action buttons
             _btn_add, _btn_up = st.columns(2)
             with _btn_add:
                 if st.button(f"+ Add {display_name}", key=f"add_{section_name}", use_container_width=True):
@@ -2077,7 +1089,6 @@ elif st.session_state["page"] == "Crew":
                                 tmp.write(sec_file.read()); tmp_path = tmp.name
                             try:
                                 text = extract_text(tmp_path)
-                                # Direct section-specific call - no classify step needed
                                 result = call_llm(text, target_section=section_name)
                                 if result:
                                     result["is_vessel_document"] = False
@@ -2095,9 +1106,8 @@ elif st.session_state["page"] == "Crew":
                             except Exception as e:
                                 st.error(f"Error: {e}")
 
-            st.markdown("<hr style='margin:8px 0;border-color:#f1f5f9;'>",unsafe_allow_html=True)
+            st.markdown("<hr style='margin:8px 0;border-color:#f1f5f9;'>", unsafe_allow_html=True)
 
-# View toggle
             view_key = f"view_{section_name}"
             if view_key not in st.session_state:
                 st.session_state[view_key] = "grid"
@@ -2114,9 +1124,8 @@ elif st.session_state["page"] == "Crew":
             render_section_content(section_name, rows, key_prefix=f"profile_{section_name}", view_mode=st.session_state[view_key])
 
             if rows and st.button(f"Clear all", key=f"clear_{section_name}"):
-                st.session_state["sections"][section_name]=[]; st.rerun()
+                st.session_state["sections"][section_name] = []; st.rerun()
 
-    # Placeholder tabs - no functionality yet
     with _crew_tabs[8]:
         st.markdown('<div class="field-empty" style="text-align:center;padding:16px;">Coming soon.</div>', unsafe_allow_html=True)
     with _crew_tabs[9]:
@@ -2137,12 +1146,12 @@ elif st.session_state["page"] == "Vessel":
         unsafe_allow_html=True
     )
 
-    vc1,vc2=st.columns([4,1])
+    vc1, vc2 = st.columns([4, 1])
     with vc1:
-        v_file=st.file_uploader("Upload vessel certificate",type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
-                                key="up_vessel",label_visibility="collapsed")
+        v_file = st.file_uploader("Upload vessel certificate", type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
+                                  key="up_vessel", label_visibility="collapsed")
     with vc2:
-        st.markdown("<div style='height:4px'></div>",unsafe_allow_html=True)
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
         if v_file and st.button("Extract", key="run_vessel", use_container_width=True):
             with st.spinner("Extracting vessel certificate..."):
                 ext = Path(v_file.name).suffix.lower()
@@ -2150,13 +1159,12 @@ elif st.session_state["page"] == "Vessel":
                     tmp.write(v_file.read()); tmp_path = tmp.name
                 try:
                     text = extract_text(tmp_path)
-                    # Direct vessel call - no classify step
                     result = call_llm(text, is_vessel=True)
                     if result:
                         result["is_vessel_document"] = True
                         result["is_resume"] = False
                         save_to_doc_tank(result, v_file.name, "vessel",
-                                         result.get("document_type","Vessel Certificate"),
+                                         result.get("document_type", "Vessel Certificate"),
                                          True, False)
                         st.session_state["popup"] = {
                             "key": "vessel_cert", "result": result,
@@ -2168,23 +1176,23 @@ elif st.session_state["page"] == "Vessel":
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-    st.markdown("<hr style='margin:8px 0;border-color:#f1f5f9;'>",unsafe_allow_html=True)
+    st.markdown("<hr style='margin:8px 0;border-color:#f1f5f9;'>", unsafe_allow_html=True)
 
-    vessels = st.session_state.get("vessels",[])
+    vessels = st.session_state.get("vessels", [])
     if not vessels:
         st.markdown('<div class="field-empty" style="text-align:center;padding:16px;">No vessel certificates yet.</div>', unsafe_allow_html=True)
     else:
         view_key = "view_vessels"
         if view_key not in st.session_state: st.session_state[view_key] = "grid"
-        vt1,vt2,_ = st.columns([1,1,6])
+        vt1, vt2, _ = st.columns([1, 1, 6])
         with vt1:
             if st.button("Grid", key="btn_grid_vessels",
                          type="primary" if st.session_state[view_key]=="grid" else "secondary"):
-                st.session_state[view_key]="grid"; st.rerun()
+                st.session_state[view_key] = "grid"; st.rerun()
         with vt2:
             if st.button("Table", key="btn_table_vessels",
                          type="primary" if st.session_state[view_key]=="table" else "secondary"):
-                st.session_state[view_key]="table"; st.rerun()
+                st.session_state[view_key] = "table"; st.rerun()
 
         render_section_content("Vessels", vessels, key_prefix="vessel_grid", view_mode=st.session_state[view_key])
 
@@ -2194,7 +1202,6 @@ elif st.session_state["page"] == "Vessel":
 elif st.session_state["page"] == "Doc Tank":
     st.markdown("### Doc Tank - Upload Log")
 
-    # ── MASTER UPLOAD ─────────────────────────────────────────
     mu1, mu2 = st.columns([4, 1])
     with mu1:
         st.markdown(
@@ -2218,7 +1225,6 @@ elif st.session_state["page"] == "Doc Tank":
                 try:
                     text = extract_text(tmp_path)
 
-                    # Call 1 - lightweight classify
                     clf = classify_document(text)
                     if not clf:
                         st.error("Classification failed."); st.stop()
@@ -2228,7 +1234,6 @@ elif st.session_state["page"] == "Doc Tank":
                     target_sec = clf.get("target_section", "")
                     doc_type   = clf.get("doc_type", "")
 
-                    # Call 2 - targeted extraction
                     with st.spinner(f"Extracting: {doc_type or target_sec}..."):
                         result = call_llm(text,
                                           target_section=target_sec,
@@ -2236,7 +1241,6 @@ elif st.session_state["page"] == "Doc Tank":
                                           is_resume=is_resume)
 
                     if result:
-                        # Stamp doc_type from classifier if LLM didn't fill it
                         if not result.get("document_type") and doc_type:
                             result["document_type"] = doc_type
                         result["is_vessel_document"] = is_vessel
@@ -2275,7 +1279,7 @@ elif st.session_state["page"] == "Doc Tank":
     if not tank:
         st.markdown('<div class="field-empty" style="text-align:center;padding:16px;">No documents processed yet.</div>', unsafe_allow_html=True)
     else:
-        s1,s2,s3,s4,s5,s6 = st.columns(6)
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
         s1.metric("Total",    len(tank))
         s2.metric("Pending",  len([d for d in tank if d.get("status")=="Pending"]))
         s3.metric("Draft",    len([d for d in tank if d.get("status")=="Draft"]))
