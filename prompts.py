@@ -11,8 +11,6 @@ from google.genai import types
 import streamlit as st
 
 from config import GEMINI_API_KEY, MODEL_NAME, LITE_MODEL_NAME, IMAGE_EXT
-from prompts import CLASSIFIER_PROMPT, VESSEL_PROMPT, RESUME_PROMPT, SECTION_PROMPTS
-
 
 def preprocess(img):
     if img.mode != "RGB": img = img.convert("RGB")
