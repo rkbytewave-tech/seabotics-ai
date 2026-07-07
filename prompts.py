@@ -1,192 +1,238 @@
-import json, re
-from pathlib import Path
+# ── CLASSIFIER PROMPT (Master Upload - call 1) ────────────────
+CLASSIFIER_PROMPT = """You are a maritime document classifier. Read the text and return ONLY valid JSON, no markdown.
 
-import fitz
-import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
-from docx import Document as DocxDocument
-import openpyxl
-from google import genai
-from google.genai import types
-import streamlit as st
+Classify the document and return:
+{
+  "is_vessel": false,
+  "is_resume": false,
+  "target_section": "",
+  "doc_type": ""
+}
 
-from config import GEMINI_API_KEY, MODEL_NAME, LITE_MODEL_NAME, IMAGE_EXT
+target_section must be one of:
+"Personal Information", "Medical", "Education", "Courses",
+"Licenses and Certification", "Travel Documents",
+"Sea Service Experience", "Bank Details", "Vessel"
 
-def preprocess(img):
-    if img.mode != "RGB": img = img.convert("RGB")
-    w, h = img.size
-    if w < 1000: img = img.resize((1000, int(h * 1000 / w)), Image.LANCZOS)
-    img = img.filter(ImageFilter.SHARPEN)
-    img = ImageEnhance.Contrast(img).enhance(1.5)
-    return img.convert("L")
+Rules:
+- is_vessel = true if document contains ship/vessel certificates, surveys, class/flag/statutory certs with IMO number but NO personal crew details
+- is_resume = true if document is a CV, resume, or sailing experience record covering multiple sections
+- If is_resume = true, set target_section = "Resume"
+- If is_vessel = true, set target_section = "Vessel"
+- Travel Documents: passport, CDC, seaman's book, visa, yellow fever card
+- Medical: PEME, D&A test, vaccination, medical fitness
+- Licenses and Certification: Certificate of Competency, Certificate of Proficiency, Endorsements, Flag Endorsements
+- Courses: STCW training, value-added courses, refresher courses, basic safety training
+- Education: degree, diploma, school certificate
+- Sea Service Experience: discharge book, sea service letter, vessel employment record
+- Bank Details: bank statement, account details, SWIFT/IFSC letter
+- Personal Information: any ID document not covered above, including PAN Card,
+  Aadhar Card, and INDoS (Indian National Database of Seafarers) printouts - these
+  are India-only documents
+"""
 
+# ── VESSEL PROMPT ─────────────────────────────────────────────
+VESSEL_PROMPT = """You are a maritime vessel certificate extraction engine.
 
-def extract_text(path):
-    ext = Path(path).suffix.lower()
-    if ext in IMAGE_EXT:
-        img = preprocess(Image.open(path))
-        return max(
-            [pytesseract.image_to_string(img, config=c) for c in ["--psm 3", "--psm 6", "--psm 11"]],
-            key=len
-        )
-    if ext == ".pdf":
-        doc = fitz.open(path)
-        pages = []
-        for p in doc:
-            t = p.get_text("text").strip()
-            if len(t) > 50:
-                pages.append(t)
-            else:
-                pix = p.get_pixmap(dpi=250)
-                img = preprocess(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
-                pages.append(pytesseract.image_to_string(img))
-        doc.close()
-        return "\n--- PAGE BREAK ---\n".join(pages)
-    if ext == ".docx":
-        return "\n".join(p.text for p in DocxDocument(path).paragraphs if p.text.strip())
-    if ext == ".txt":
-        with open(path) as f:
-            return f.read()
-    if ext in [".xlsx", ".xls"]:
-        wb = openpyxl.load_workbook(path, data_only=True)
-        return "\n".join(
-            "  |  ".join(str(c) for c in r if c)
-            for s in wb.worksheets
-            for r in s.iter_rows(values_only=True)
-        )
-    raise ValueError(f"Unsupported: {ext}")
+CLASSIFICATION SOCIETIES (these go in classification_society ONLY):
+ABS, American Bureau of Shipping, DNV, Det Norske Veritas, Lloyd's Register, LR,
+ClassNK, Nippon Kaiji Kyokai, Bureau Veritas, BV, China Classification Society, CCS,
+RINA, Registro Italiano Navale, Korean Register, KR, Indian Register of Shipping, IRS,
+Polish Register of Shipping, PRS, Croatian Register of Shipping, CRS
 
+ISSUING AUTHORITY = the flag state government, maritime administration, or delegated authority
+that legally issued the certificate (e.g. "Republic of Panama - Maritime Authority",
+"Bahamas Maritime Authority", "Marshall Islands Registry", "UK Maritime and Coastguard Agency").
+A classification society can be a delegated issuing authority for statutory certs - if the cert
+was physically issued by DNV on behalf of a flag state, issuing_authority = flag state,
+classification_society = DNV.
 
-def _llm_vision_call(system_prompt, path, max_tokens=8000):
-    """Vision call - renders PDF pages as images and sends to Gemini Flash.
-    Used for resumes and sea service docs where table layout matters."""
-    doc = fitz.open(path)
-    image_parts = []
-    for page in doc:
-        pix = page.get_pixmap(dpi=150)  # 150 Dpi = 6 tiles/page = ~1548 tokens/page
-        image_parts.append(
-            types.Part.from_bytes(data=pix.tobytes("png"), mime_type="image/png")
-        )
-    doc.close()
+DATE FORMAT: DD-MMM-YYYY. LIFETIME stays as LIFETIME.
+Return ONLY valid JSON, no markdown.
 
-    if not image_parts:
-        return None
+{
+  "is_vessel_document": true,
+  "document_type": "",
+  "vessel_certificate": {
+    "certificate_name": "",
+    "certificate_category": "",
+    "vessel_name": "",
+    "imo_number": "",
+    "certificate_number": "",
+    "cert_type": "",
+    "issuing_authority": "",
+    "classification_society": "",
+    "date_of_issue": "",
+    "date_of_expiry": "",
+    "date_of_survey": ""
+  },
+  "missing_fields": [],
+  "validation_flags": [],
+  "raw_text_summary": ""
+}
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=image_parts + [types.Part(text="Extract all information from these document pages.")]
-                    )
-                ],
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=0.1,
-                    max_output_tokens=max_tokens,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    response_mime_type="application/json",
-                )
-            )
-            raw = response.text.strip()
-            if not raw: continue
-            raw = re.sub(r"^```[a-z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
-            start = raw.find("{"); end = raw.rfind("}") + 1
-            if start == -1 or end == 0: continue
-            return json.loads(raw[start:end])
-        except json.JSONDecodeError:
-            continue
-        except Exception as e:
-            st.error(f"API error: {e}")
-            return None
-    st.error("Pipeline failed after 3 attempts.")
-    return None
+certificate_category must be one of: "Class", "Flag State", "Statutory"
+cert_type must be one of: "Interim", "Full Term", "Short Term"
+"""
 
+# ── RESUME PROMPT ─────────────────────────────────────────────
+RESUME_PROMPT = """You are SeaBotics.ai - maritime crew ERP document extraction engine for CVs and resumes.
 
-def _llm_call(system_prompt, user_text, max_tokens=4000, text_limit=30000, model=None):
-    """Core LLM caller - shared by all pipelines."""
-    model = model or MODEL_NAME
-    if len(user_text) > text_limit:
-        user_text = user_text[:text_limit]
-    if not user_text.strip():
-        return None
+CRITICAL DISTINCTION - read carefully:
+- licenses_certifications = Official legal documents issued by a maritime authority granting rank/qualification to work.
+  Examples: Certificate of Competency (CoC), Certificate of Proficiency (CoP), GMDSS General Operator Certificate,
+  Flag Endorsements, STCW Endorsements. These have an issuing authority (MARINA, MCA, flag state).
+- courses = Training classes attended at a training centre. These prove attendance, not legal qualification.
+  Examples: Basic Safety Training, ECDIS course, Advanced Fire Fighting, ARPA, crowd management.
+  These are issued by training institutions, not maritime authorities.
+  Rule: if it sounds like a class you attended at a school/centre, it is a course.
+  Rule: if it is a government/authority issued document granting you the right to work at a rank, it is a license.
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+INDIA-ONLY FIELDS: marital_status applies to everyone. indos_number, pan_number,
+and aadhar_number are Indian government/seafarer identifiers - only extract these
+if nationality is India (or the document itself is an INDoS printout, PAN Card,
+or Aadhar Card). Leave them blank for every other nationality, do not guess.
 
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=f"Extract all information:\n\n{user_text}",
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=0.1,
-                    max_output_tokens=max_tokens,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    response_mime_type="application/json",
-                )
-            )
-            raw = response.text.strip()
-            if not raw: continue
-            raw = re.sub(r"^```[a-z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
-            start = raw.find("{"); end = raw.rfind("}") + 1
-            if start == -1 or end == 0: continue
-            return json.loads(raw[start:end])
-        except json.JSONDecodeError:
-            continue
-        except Exception as e:
-            st.error(f"API error: {e}")
-            return None
-    st.error("Pipeline failed after 3 attempts.")
-    return None
+DATE FORMAT: DD-MMM-YYYY. LIFETIME stays as LIFETIME.
+Return ONLY valid JSON, no markdown.
 
+{
+  "document_type": "",
+  "is_vessel_document": false,
+  "is_resume": true,
+  "personal": {
+    "full_name":"","surname":"","email":"","gender":"","contact_number":"",
+    "date_of_birth":"","nationality":"","blood_group":"","current_rank":"",
+    "identification_mark":"","availability_date":"","address":"","country":"",
+    "state":"","zip_code":"","domestic_airport":"","international_airport":"",
+    "passport_number":"","cdc_number":"","height":"","weight":"",
+    "boiler_suit_size":"","safety_shoe_size":"","shirt_size":"","trouser_size":"",
+    "marital_status":"","indos_number":"","pan_number":"","aadhar_number":""
+  },
+  "sea_service": [{"company":"","rank":"","vessel_name":"","vessel_type":"","voyage_type":"","imo_number":"","flag_country":"","grt":"","dwt":"","bhp":"","main_engine_type":"","main_engine_kw":"","sign_on_port":"","sign_off_port":"","start_date":"","end_date":"","reason_sign_off":""}],
+  "travel_documents": [{"document_type":"","document_name":"","certificate_number":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
+  "medical": [{"document_type":"","document_name":"","certificate_number":"","date_of_issue":"","date_of_expiry":""}],
+  "education": [{"institution_name":"","country":"","education_level":"","field_of_study":"","start_date":"","completion_date":""}],
+  "courses": [{"document_name":"","certificate_number":"","type":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
+  "licenses_certifications": [{"document_name":"","certificate_number":"","type":"","issuing_authority":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
+  "bank_details": [{"bank_name":"","branch_name":"","account_type":"","account_name":"","account_number":"","ifsc_swift":""}],
+  "missing_fields":[],
+  "validation_flags":[],
+  "raw_text_summary":""
+}"""
 
-def classify_document(text):
-    """Step 1 for Master Upload - lightweight classifier, ~200 tokens."""
-    return _llm_call(CLASSIFIER_PROMPT, text, max_tokens=200, text_limit=3000, model=LITE_MODEL_NAME)
+# ── SECTION-SPECIFIC PROMPTS ──────────────────────────────────
+SECTION_PROMPTS = {
 
+"Medical": """You are a maritime medical document extractor.
+Extract medical certificate / vaccination / test data. Also extract any personal info found.
+DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
+{
+  "document_type": "",
+  "personal": {"full_name":"","date_of_birth":"","nationality":"","passport_number":"","cdc_number":""},
+  "medical": [{"document_type":"","document_name":"","certificate_number":"","date_of_issue":"","date_of_expiry":""}],
+  "missing_fields":[]
+}
+document_type must be one of: "Medical Test","Vaccination"
+document_name examples: "PEME - Pre-Employment Medical Examination","D&A - Drug & Alcohol Test","Yellow Fever","COVID 19"
+""",
 
-# Sections needing Flash on the text path (complex tables)
-_FLASH_SECTIONS = {"Sea Service Experience"}
+"Travel Documents": """You are a maritime travel document extractor.
+Extract passport, CDC, seaman's book, visa, and similar documents. Also extract any personal info found.
+indos_number (INDoS - Indian National Database of Seafarers) is India-only: only extract it
+if nationality is India or the document itself is an INDoS printout. Leave blank otherwise.
+DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
+{
+  "document_type": "",
+  "personal": {"full_name":"","surname":"","date_of_birth":"","nationality":"","gender":"","blood_group":"","current_rank":"","address":"","country":"","state":"","zip_code":"","domestic_airport":"","international_airport":"","indos_number":""},
+  "travel_documents": [{"document_type":"","document_name":"","certificate_number":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
+  "missing_fields":[]
+}
+document_type examples: "Passport","CDC","Seaman's Book","Visa","Yellow Fever Card"
+""",
 
-# Sections that use Gemini vision even on digital PDFs (layout/table critical)
-_VISION_SECTIONS = {"Sea Service Experience"}
+"Licenses and Certification": """You are a maritime licensing document extractor.
+Extract Certificate of Competency, Certificate of Proficiency, Endorsements, Flag Endorsements.
+Also extract any personal info found.
+DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
+{
+  "document_type": "",
+  "personal": {"full_name":"","date_of_birth":"","nationality":"","cdc_number":"","current_rank":""},
+  "licenses_certifications": [{"document_name":"","certificate_number":"","type":"","issuing_authority":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
+  "missing_fields":[]
+}
+type must be one of: "STCW - CERTIFICATE OF COMPETENCY","STCW - CERTIFICATE OF PROFICIENCY","STCW - ENDORSMENT","FLAG - FLAG ENDORSEMENT"
+""",
 
+"Courses": """You are a maritime training course document extractor.
+Extract STCW training, value-added courses, refresher courses, basic safety training.
+Also extract any personal info found.
+DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
+{
+  "document_type": "",
+  "personal": {"full_name":"","date_of_birth":"","nationality":""},
+  "courses": [{"document_name":"","certificate_number":"","type":"","place_of_issue":"","date_of_issue":"","date_of_expiry":""}],
+  "missing_fields":[]
+}
+type must be one of: "STCW","FLAG Endorsement","Value Added","Other"
+""",
 
-def call_llm(text, target_section=None, is_vessel=False, is_resume=False, path=None):
-    """
-    Unified entry point.
-    - target_section set  -> use section-specific prompt (1 call)
-    - is_vessel = True    -> use vessel prompt (1 call)
-    - is_resume = True    -> use resume prompt (1 call)
-    - path                -> if PDF, enables vision routing for eligible doc types
-    - all None/False      -> full resume prompt as fallback
+"Education": """You are an education document extractor for maritime crew profiles.
+Extract degrees, diplomas, school/college certificates. Also extract any personal info found.
+DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
+{
+  "document_type": "",
+  "personal": {"full_name":"","date_of_birth":"","nationality":""},
+  "education": [{"institution_name":"","country":"","education_level":"","field_of_study":"","start_date":"","completion_date":""}],
+  "missing_fields":[]
+}
+""",
 
-    Vision routing (path must be a .pdf):
-    - Resumes always use vision - sea service tables need visual layout
-    - Sea service section upload also uses vision
-    - All other sections use text path (flat structure, PyMuPDF/Tesseract sufficient)
+"Sea Service Experience": """You are a maritime sea service record extractor.
+Extract employment/discharge records, sea service letters, vessel history.
+Also extract any personal info found.
+DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
+{
+  "document_type": "",
+  "personal": {"full_name":"","cdc_number":"","current_rank":""},
+  "sea_service": [{"company":"","rank":"","vessel_name":"","vessel_type":"","voyage_type":"","imo_number":"","flag_country":"","grt":"","dwt":"","bhp":"","main_engine_type":"","main_engine_kw":"","sign_on_port":"","sign_off_port":"","start_date":"","end_date":"","reason_sign_off":""}],
+  "missing_fields":[]
+}
+vessel_type must be one of: "BULK CARRIER","CHEMICAL TANKER","CONTAINER SHIP","CRUISE SHIP","GAS CARRIER","GENERAL CARGO SHIP","LIVESTOCK CARRIER","OIL TANKER","RO-RO SHIP","TUGBOAT"
+voyage_type must be one of: "Foreign Going","Near Coastal","Coastal","Home Trade"
+""",
 
-    Model routing (text path):
-    - Flash (MODEL_NAME): resumes, sea service experience
-    - Flash-Lite (LITE_MODEL_NAME): classify, vessel certs, all flat sections
-    """
-    use_vision = path and Path(path).suffix.lower() == ".pdf"
+"Bank Details": """You are a bank details extractor for maritime crew profiles.
+Extract bank account information. Also extract any personal info found.
+DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
+{
+  "document_type": "",
+  "personal": {"full_name":"","nationality":""},
+  "bank_details": [{"bank_name":"","branch_name":"","account_type":"","account_name":"","account_number":"","ifsc_swift":""}],
+  "missing_fields":[]
+}
+""",
 
-    if is_vessel:
-        return _llm_call(VESSEL_PROMPT, text, max_tokens=2000, model=LITE_MODEL_NAME)
-    if is_resume:
-        if use_vision:
-            return _llm_vision_call(RESUME_PROMPT, path, max_tokens=8000)
-        return _llm_call(RESUME_PROMPT, text, max_tokens=8000, text_limit=50000, model=MODEL_NAME)
-    if target_section and target_section in SECTION_PROMPTS:
-        if use_vision and target_section in _VISION_SECTIONS:
-            return _llm_vision_call(SECTION_PROMPTS[target_section], path, max_tokens=4000)
-        m = MODEL_NAME if target_section in _FLASH_SECTIONS else LITE_MODEL_NAME
-        return _llm_call(SECTION_PROMPTS[target_section], text, max_tokens=4000, model=m)
-    return _llm_call(RESUME_PROMPT, text, max_tokens=8000, model=MODEL_NAME)
+"Personal Information": """You are a personal information extractor for maritime crew profiles.
+Extract all personal/identity details from any ID document, including PAN Card, Aadhar Card,
+and INDoS (Indian National Database of Seafarers) printouts.
+marital_status applies to everyone. indos_number, pan_number, and aadhar_number are India-only -
+only extract these if nationality is India or the source document is itself a PAN Card, Aadhar
+Card, or INDoS printout. Leave them blank for every other nationality, do not guess.
+DATE FORMAT: DD-MMM-YYYY. Return ONLY valid JSON, no markdown.
+{
+  "document_type": "",
+  "personal": {
+    "full_name":"","surname":"","email":"","gender":"","contact_number":"",
+    "date_of_birth":"","nationality":"","blood_group":"","current_rank":"",
+    "identification_mark":"","availability_date":"","address":"","country":"",
+    "state":"","zip_code":"","domestic_airport":"","international_airport":"",
+    "passport_number":"","cdc_number":"","height":"","weight":"",
+    "boiler_suit_size":"","safety_shoe_size":"","shirt_size":"","trouser_size":"",
+    "marital_status":"","indos_number":"","pan_number":"","aadhar_number":""
+  },
+  "missing_fields":[]
+}
+document_type examples for this section also include: "PAN Card","Aadhar Card","INDoS Printout"
+""",
+}
