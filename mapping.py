@@ -213,7 +213,12 @@ def personal_to_profile(p):
          "international_airport":"International Airport","passport_number":"Passport Number",
          "cdc_number":"CDC / Seaman's Book Number","height":"Height","weight":"Weight",
          "boiler_suit_size":"Boiler Suit Size","safety_shoe_size":"Safety Shoe Size",
-         "shirt_size":"Shirt Size","trouser_size":"Trouser Size"}
+         "shirt_size":"Shirt Size","trouser_size":"Trouser Size",
+         "marital_status":"Marital Status",
+         # India-only - populated only when the LLM found nationality = India (see
+         # prompts.py gating instructions). build_profile_payload() in api_mapping.py
+         # re-checks nationality before sending indos_number, as a second safety net.
+         "indos_number":"INDoS Number","pan_number":"PAN Number","aadhar_number":"Aadhar Number"}
     return {v: p[k] for k, v in m.items() if p.get(k)}
 
 
