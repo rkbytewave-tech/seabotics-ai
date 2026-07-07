@@ -16,6 +16,7 @@ from mapping import (
     personal_to_profile, result_to_rows, vessel_result_to_row,
 )
 from pipeline import extract_text, classify_document, call_llm
+from smart_upload_ui import render_ai_smart_upload_tab
 
 st.set_page_config(page_title="SeaBotics.ai", page_icon="S", layout="wide", initial_sidebar_state="expanded")
 
@@ -38,6 +39,87 @@ html, body, [class*="css"] { font-family: 'Segoe UI', sans-serif; }
 .grid-card-sub { font-size:0.72rem; color:#64748b; margin-bottom:2px; }
 .invalid-flag { background:#fce7f3; border:1px solid #f9a8d4; border-radius:6px; padding:4px 8px; font-size:0.7rem; color:#9d174d; margin-top:3px; display:inline-block; }
 .vessel-card { background:#f0f9ff; border:1px solid #bae6fd; border-radius:8px; padding:12px; margin-bottom:8px; }
+
+/* ── Doc Tank reskin (matches ui_mockups/02-04) ─────────────── */
+.dt-banner {
+  background: linear-gradient(90deg,#4338ca 0%,#4f46e5 60%,#6366f1 100%);
+  border-radius: 10px; padding: 18px 24px; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 14px;
+}
+.dt-banner-icon {
+  width: 42px; height: 42px; border-radius: 10px; flex-shrink: 0;
+  background: rgba(255,255,255,0.18);
+  display: flex; align-items: center; justify-content: center; font-size: 20px;
+}
+.dt-banner-title { color:#ffffff; font-size:1.15rem; font-weight:700; }
+.dt-banner-sub   { color:#dbeafe; font-size:0.78rem; margin-top:2px; }
+
+div[data-testid="stVerticalBlockBorderWrapper"]:has(.dt-upload-marker) {
+  border: 1.5px dashed #93c5fd !important; border-radius: 10px !important; background:#ffffff !important;
+}
+.dt-upload-title { font-size:0.9rem; font-weight:700; color:#1e3a8a; }
+.dt-upload-desc  { font-size:0.72rem; color:#64748b; margin-top:2px; }
+
+.st-key-dt_tab_crew button, .st-key-dt_tab_vessel button {
+  border-radius: 8px !important; font-weight: 600 !important; font-size: 0.82rem !important;
+}
+
+.dt-stats-card { display:flex; border:1px solid #e2e8f0; border-radius:10px; overflow:hidden; background:#fff; }
+.dt-stat { flex:1; padding:12px 18px; border-right:1px solid #eef2f7; }
+.dt-stat:last-child { border-right:none; }
+.dt-stat-label { font-size:0.62rem; font-weight:700; letter-spacing:0.05em; color:#94a3b8; text-transform:uppercase; margin-bottom:4px; }
+.dt-stat-value { font-size:1.35rem; font-weight:700; color:#0f172a; }
+.dt-stat.pending  { border-left:4px solid #f59e0b; }
+.dt-stat.draft    { border-left:4px solid #d97706; }
+.dt-stat.approved { border-left:4px solid #22c55e; }
+.dt-stat.pending  .dt-stat-value { color:#d97706; }
+.dt-stat.draft    .dt-stat-value { color:#b45309; }
+.dt-stat.approved .dt-stat-value { color:#16a34a; }
+
+.dt-type-pill { display:inline-block; font-size:0.65rem; font-weight:600; padding:2px 9px; border-radius:999px; }
+.dt-type-cv      { background:#ede9fe; color:#6d28d9; }
+.dt-type-license { background:#dbeafe; color:#1d4ed8; }
+.dt-type-travel  { background:#cffafe; color:#0e7490; }
+.dt-type-medical { background:#dcfce7; color:#15803d; }
+.dt-type-vessel  { background:#ffedd5; color:#c2410c; }
+.dt-type-other   { background:#f1f5f9; color:#475569; }
+
+.dt-status-dot { display:inline-flex; align-items:center; gap:5px; font-size:0.75rem; font-weight:600; }
+.dt-status-dot::before { content:""; width:7px; height:7px; border-radius:50%; }
+.dt-status-approved { color:#16a34a; } .dt-status-approved::before { background:#22c55e; }
+.dt-status-draft    { color:#b45309; } .dt-status-draft::before    { background:#f59e0b; }
+.dt-status-pending  { color:#64748b; } .dt-status-pending::before  { background:#94a3b8; }
+
+/* ── Personal Info reskin (matches ui_mockups/01) ───────────── */
+.pi-banner {
+  background: linear-gradient(90deg,#4338ca 0%,#6366f1 55%,#818cf8 100%);
+  border-radius: 10px; padding: 20px 26px; margin-bottom: 16px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.pi-banner-left { display:flex; align-items:center; gap:16px; }
+.pi-avatar-circle {
+  width:56px; height:56px; border-radius:50%; background:#c7d2fe; flex-shrink:0;
+  display:flex; align-items:center; justify-content:center; font-size:1.2rem; font-weight:700; color:#4338ca;
+}
+.pi-name { color:#ffffff; font-size:1.15rem; font-weight:700; letter-spacing:0.3px; }
+.pi-sub  { color:#dbeafe; font-size:0.78rem; margin-top:2px; }
+.pi-badge { font-size:0.68rem; font-weight:700; padding:5px 12px; border-radius:6px; color:#ffffff; display:inline-block; }
+.pi-badge-complete { background:#22c55e; }
+.pi-badge-partial  { background:#f59e0b; }
+.pi-badge-empty    { background:#94a3b8; }
+
+.pi-overview-card { background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:16px 20px; margin-bottom:16px; }
+.pi-overview-title { font-size:0.95rem; font-weight:700; color:#0f172a; }
+.pi-overview-sub   { font-size:0.75rem; color:#64748b; margin-top:2px; margin-bottom:10px; }
+.pi-pill { display:inline-block; font-size:0.68rem; font-weight:600; padding:4px 11px; border-radius:999px; margin-right:6px; }
+.pi-pill-pending  { background:#fef3c7; color:#92400e; }
+.pi-pill-progress { background:#dbeafe; color:#1d4ed8; }
+.pi-pill-complete { background:#dcfce7; color:#166534; }
+
+.pi-section-card    { background:#fff; border:1px solid #e2e8f0; border-radius:10px; margin-bottom:14px; overflow:hidden; }
+.pi-section-heading { font-size:0.82rem; font-weight:700; color:#4338ca; padding:12px 18px; border-bottom:1px solid #eef2f7; }
+.pi-field-row        { padding:12px 18px; border-bottom:1px solid #f8fafc; }
+.pi-field-row:last-child { border-bottom:none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -983,63 +1065,129 @@ elif st.session_state["page"] == "Crew":
     _crew_tabs = st.tabs([
         "Personal Info", "Experience", "Licenses and Certifications",
         "Medical", "Education", "Courses", "Bank Details",
-        "Travel Documents", "Doc Check-List", "Travel Details",
+        "Travel Documents", "Doc Check-List", "Travel Details", "AI Smart Upload",
     ])
 
     with _crew_tabs[0]:
-        st.markdown(
-            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
-            '<span style="font-size:1.1rem;">✨</span>'
-            '<span style="font-size:0.9rem;font-weight:700;color:#0f172a;">AI-Assisted Profile Fill</span>'
-            '<span style="font-size:0.75rem;color:#64748b;">'
-            '&nbsp;Upload your CV or Resume - AI reads it and fills all sections for your review'
-            '</span></div>',
-            unsafe_allow_html=True
-        )
-        _rcu1, _rcu2 = st.columns([5, 1])
-        with _rcu1:
-            resume_file = st.file_uploader("Upload CV or Resume",
-                type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
-                key="up_resume", label_visibility="collapsed")
-        with _rcu2:
-            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-            if resume_file and st.button("Extract", key="run_resume", use_container_width=True):
-                with st.spinner("Running resume pipeline..."):
-                    ext = Path(resume_file.name).suffix.lower()
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                        tmp.write(resume_file.read()); tmp_path = tmp.name
-                    try:
-                        text = extract_text(tmp_path)
-                        result = call_llm(text, is_resume=True)
-                        if result:
-                            result["is_vessel_document"] = False
-                            result["is_resume"] = True
-                            save_to_doc_tank(result, resume_file.name, "master",
-                                             result.get("document_type", "CV / Resume"),
-                                             False, True)
-                            st.session_state["popup"] = {
-                                "key": "resume_personal",
-                                "result": result,
-                                "filename": resume_file.name,
-                                "source": "master",
-                                "target_section": "Resume",
-                                "tank_id": st.session_state["doc_tank"][-1]["tank_id"]
-                            }
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-
-        st.markdown("<hr style='margin:8px 0;border-color:#f1f5f9;'>", unsafe_allow_html=True)
         profile = st.session_state["profile"]
         ORG_MAP = {"person_name":"Full Name","surname":"Surname","email":"Email Address","gender":"Gender","contact_number":"Phone Number","date_of_birth":"Date of Birth","nationality":"Nationality","blood_group":"Blood Group","rank":"Rank / Designation","identification_mark":"Identification Mark","availability_date":"Availability Date","address":"Residential Address","country":"Country","state":"State","zip_code":"ZIP / PIN Code","domestic_airport":"Domestic Airport","international_airport":"International Airport","passport_number":"Passport Number","cdc_number":"CDC / Seaman's Book Number","height":"Height","weight":"Weight","boiler_suit_size":"Boiler Suit Size","safety_shoe_size":"Safety Shoe Size","shirt_size":"Shirt Size","trouser_size":"Trouser Size"}
-        for i in range(0, len(PERSONAL_FIELDS), 3):
-            row_f = PERSONAL_FIELDS[i:i+3]; cols = st.columns(3)
-            for j, (fk, fl) in enumerate(row_f):
-                with cols[j]:
-                    org_key = ORG_MAP.get(fk, fl); val = profile.get(org_key, "")
-                    st.markdown(f'<div class="field-label">{fl}</div>', unsafe_allow_html=True)
-                    if val: st.markdown(f'<div class="field-value">{val}</div>', unsafe_allow_html=True)
-                    else:   st.markdown(f'<div class="field-empty">-</div>', unsafe_allow_html=True)
+
+        _pi_name     = profile.get("Full Name", "") or "Unnamed Crew"
+        _pi_cdc      = profile.get("CDC / Seaman's Book Number", "")
+        _pi_initials = "".join(w[0] for w in _pi_name.split()[:2]).upper() if profile.get("Full Name") else "?"
+        _pi_total    = len(PERSONAL_FIELDS)
+        _pi_filled   = sum(1 for fk, fl in PERSONAL_FIELDS if profile.get(ORG_MAP.get(fk, fl), ""))
+
+        if _pi_filled == 0:
+            _pi_badge_cls, _pi_badge_txt = "pi-badge-empty", "Not Started"
+        elif _pi_filled < _pi_total:
+            _pi_badge_cls, _pi_badge_txt = "pi-badge-partial", "In Progress"
+        else:
+            _pi_badge_cls, _pi_badge_txt = "pi-badge-complete", "Complete"
+
+        st.markdown(
+            f'<div class="pi-banner">'
+            f'<div class="pi-banner-left">'
+            f'<div class="pi-avatar-circle">{_pi_initials}</div>'
+            f'<div><div class="pi-name">{_pi_name.upper()}</div>'
+            f'<div class="pi-sub">{_pi_cdc if _pi_cdc else "No CDC on file"}</div></div>'
+            f'</div>'
+            f'<div class="pi-badge {_pi_badge_cls}">{_pi_badge_txt}</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+        _pi_pill_cls = "pi-pill-pending" if _pi_filled == 0 else ("pi-pill-complete" if _pi_filled == _pi_total else "pi-pill-progress")
+        _pi_pill_txt = "No fields captured yet" if _pi_filled == 0 else f"{_pi_filled} of {_pi_total} fields captured"
+        st.markdown(
+            '<div class="pi-overview-card">'
+            '<div class="pi-overview-title">Profile Overview</div>'
+            '<div class="pi-overview-sub">Personal and professional information extracted from uploaded documents</div>'
+            f'<span class="pi-pill {_pi_pill_cls}">{_pi_pill_txt}</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if "pi_show_upload" not in st.session_state:
+            st.session_state["pi_show_upload"] = not bool(profile)
+        if st.button("Edit Profile", key="pi_edit_toggle", use_container_width=False):
+            st.session_state["pi_show_upload"] = not st.session_state["pi_show_upload"]
+            st.rerun()
+
+        if st.session_state["pi_show_upload"]:
+            st.markdown(
+                '<div style="display:flex;align-items:center;gap:8px;margin:10px 0 8px 0;">'
+                '<span style="font-size:1.1rem;">✨</span>'
+                '<span style="font-size:0.9rem;font-weight:700;color:#0f172a;">AI-Assisted Profile Fill</span>'
+                '<span style="font-size:0.75rem;color:#64748b;">'
+                '&nbsp;Upload your CV or Resume - AI reads it and fills all sections for your review'
+                '</span></div>',
+                unsafe_allow_html=True
+            )
+            _rcu1, _rcu2 = st.columns([5, 1])
+            with _rcu1:
+                resume_file = st.file_uploader("Upload CV or Resume",
+                    type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
+                    key="up_resume", label_visibility="collapsed")
+            with _rcu2:
+                st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+                if resume_file and st.button("Extract", key="run_resume", use_container_width=True):
+                    with st.spinner("Running resume pipeline..."):
+                        ext = Path(resume_file.name).suffix.lower()
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                            tmp.write(resume_file.read()); tmp_path = tmp.name
+                        try:
+                            text = extract_text(tmp_path)
+                            result = call_llm(text, is_resume=True, path=tmp_path)
+                            if result:
+                                result["is_vessel_document"] = False
+                                result["is_resume"] = True
+                                save_to_doc_tank(result, resume_file.name, "master",
+                                                 result.get("document_type", "CV / Resume"),
+                                                 False, True)
+                                st.session_state["popup"] = {
+                                    "key": "resume_personal",
+                                    "result": result,
+                                    "filename": resume_file.name,
+                                    "source": "master",
+                                    "target_section": "Resume",
+                                    "tank_id": st.session_state["doc_tank"][-1]["tank_id"]
+                                }
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+            st.markdown("<hr style='margin:8px 0;border-color:#f1f5f9;'>", unsafe_allow_html=True)
+
+        _PI_GROUPS = [
+            ("Personal Details", ["person_name","surname","rank","date_of_birth","gender","blood_group","identification_mark","marital_status","availability_date"]),
+            ("Contact Details", ["email","contact_number","nationality","address","country","state","zip_code"]),
+            ("Identity & Travel Documents", ["passport_number","cdc_number","domestic_airport","international_airport","indos_number","pan_number","aadhar_number"]),
+            ("Physical & Sizing", ["height","weight","boiler_suit_size","safety_shoe_size","shirt_size","trouser_size"]),
+        ]
+        _pi_by_key = {fk: fl for fk, fl in PERSONAL_FIELDS}
+        _pi_grouped_keys = set()
+        for _grp_name, _grp_keys in _PI_GROUPS:
+            _pi_grouped_keys.update(_grp_keys)
+        _pi_other = [fk for fk, fl in PERSONAL_FIELDS if fk not in _pi_grouped_keys]
+        if _pi_other:
+            _PI_GROUPS.append(("Other Details", _pi_other))
+
+        for _grp_name, _grp_keys in _PI_GROUPS:
+            _grp_fields = [(fk, _pi_by_key[fk]) for fk in _grp_keys if fk in _pi_by_key]
+            if not _grp_fields:
+                continue
+            with st.container(border=True):
+                st.markdown(f'<div class="pi-section-heading" style="padding:0 0 8px 0;border-bottom:1px solid #eef2f7;margin-bottom:10px;">{_grp_name}</div>', unsafe_allow_html=True)
+                for i in range(0, len(_grp_fields), 3):
+                    row_f = _grp_fields[i:i+3]
+                    cols = st.columns(3)
+                    for j, (fk, fl) in enumerate(row_f):
+                        with cols[j]:
+                            org_key = ORG_MAP.get(fk, fl); val = profile.get(org_key, "")
+                            st.markdown(f'<div class="field-label">{fl}</div>', unsafe_allow_html=True)
+                            if val: st.markdown(f'<div class="field-value">{val}</div>', unsafe_allow_html=True)
+                            else:   st.markdown(f'<div class="field-empty">-</div>', unsafe_allow_html=True)
+
         if profile:
             if st.button("Clear Personal Info", key="clear_personal"):
                 st.session_state["profile"] = {}; st.rerun()
@@ -1089,7 +1237,7 @@ elif st.session_state["page"] == "Crew":
                                 tmp.write(sec_file.read()); tmp_path = tmp.name
                             try:
                                 text = extract_text(tmp_path)
-                                result = call_llm(text, target_section=section_name)
+                                result = call_llm(text, target_section=section_name, path=tmp_path)
                                 if result:
                                     result["is_vessel_document"] = False
                                     result["is_resume"] = False
@@ -1130,6 +1278,8 @@ elif st.session_state["page"] == "Crew":
         st.markdown('<div class="field-empty" style="text-align:center;padding:16px;">Coming soon.</div>', unsafe_allow_html=True)
     with _crew_tabs[9]:
         st.markdown('<div class="field-empty" style="text-align:center;padding:16px;">Coming soon.</div>', unsafe_allow_html=True)
+    with _crew_tabs[10]:
+        render_ai_smart_upload_tab(save_to_doc_tank)
 
 # ════════════════════════════════════════════════════════════
 #  VESSELS
@@ -1200,63 +1350,71 @@ elif st.session_state["page"] == "Vessel":
 #  DOC TANK
 # ════════════════════════════════════════════════════════════
 elif st.session_state["page"] == "Doc Tank":
-    st.markdown("### Doc Tank - Upload Log")
+    st.markdown(
+        '<div class="dt-banner">'
+        '<div class="dt-banner-icon">&#128196;</div>'
+        '<div><div class="dt-banner-title">Doc Tank</div>'
+        '<div class="dt-banner-sub">Global document log &nbsp;|&nbsp; All crew and vessel uploads</div>'
+        '</div></div>',
+        unsafe_allow_html=True
+    )
 
-    mu1, mu2 = st.columns([4, 1])
-    with mu1:
+    _dt_upload_box = st.container(border=True, key="dt_upload_card")
+    with _dt_upload_box:
+        st.markdown('<span class="dt-upload-marker"></span>', unsafe_allow_html=True)
         st.markdown(
-            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
-            '<span style="font-size:1.1rem;">✨</span>'
-            '<span style="font-size:0.9rem;font-weight:700;color:#0f172a;">AI Smart Import</span>'
-            '<span style="font-size:0.75rem;color:#64748b;">'
-            '&nbsp;Upload any doc - CV, certificate, or merged PDF - AI classifies and fills automatically'
-            '</span></div>',
+            '<div class="dt-upload-title">Master Upload</div>'
+            '<div class="dt-upload-desc">One drop point for every document &mdash; crew or vessel. '
+            'The pipeline identifies, classifies, and routes each file automatically.</div>',
             unsafe_allow_html=True
         )
-        master_file = st.file_uploader("master", type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
-                                       label_visibility="collapsed", key="master_uploader")
-    with mu2:
-        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        if master_file and st.button("Run Pipeline", use_container_width=True, key="run_master"):
-            with st.spinner("Classifying document..."):
-                ext = Path(master_file.name).suffix.lower()
-                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                    tmp.write(master_file.read()); tmp_path = tmp.name
-                try:
-                    text = extract_text(tmp_path)
+        mu1, mu2 = st.columns([4, 1])
+        with mu1:
+            master_file = st.file_uploader("master", type=["pdf","png","jpg","jpeg","tiff","docx","txt"],
+                                           label_visibility="collapsed", key="master_uploader")
+        with mu2:
+            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+            if master_file and st.button("Upload & Extract", use_container_width=True, type="primary", key="run_master"):
+                with st.spinner("Classifying document..."):
+                    ext = Path(master_file.name).suffix.lower()
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                        tmp.write(master_file.read()); tmp_path = tmp.name
+                    try:
+                        text = extract_text(tmp_path)
 
-                    clf = classify_document(text)
-                    if not clf:
-                        st.error("Classification failed."); st.stop()
+                        clf = classify_document(text)
+                        if not clf:
+                            st.error("Classification failed."); st.stop()
 
-                    is_vessel  = clf.get("is_vessel", False)
-                    is_resume  = clf.get("is_resume", False)
-                    target_sec = clf.get("target_section", "")
-                    doc_type   = clf.get("doc_type", "")
+                        is_vessel  = clf.get("is_vessel", False)
+                        is_resume  = clf.get("is_resume", False)
+                        target_sec = clf.get("target_section", "")
+                        doc_type   = clf.get("doc_type", "")
 
-                    with st.spinner(f"Extracting: {doc_type or target_sec}..."):
-                        result = call_llm(text,
-                                          target_section=target_sec,
-                                          is_vessel=is_vessel,
-                                          is_resume=is_resume)
+                        with st.spinner(f"Extracting: {doc_type or target_sec}..."):
+                            result = call_llm(text,
+                                              target_section=target_sec,
+                                              is_vessel=is_vessel,
+                                              is_resume=is_resume,
+                                              path=tmp_path)
 
-                    if result:
-                        if not result.get("document_type") and doc_type:
-                            result["document_type"] = doc_type
-                        result["is_vessel_document"] = is_vessel
-                        result["is_resume"] = is_resume
-                        save_to_doc_tank(result, master_file.name, "master",
-                                         result.get("document_type", doc_type),
-                                         is_vessel, is_resume)
-                        st.session_state["popup"] = {
-                            "key": "master", "result": result,
-                            "filename": master_file.name, "source": "master",
-                            "target_section": target_sec,
-                            "tank_id": st.session_state["doc_tank"][-1]["tank_id"]
-                        }
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                        if result:
+                            if not result.get("document_type") and doc_type:
+                                result["document_type"] = doc_type
+                            result["is_vessel_document"] = is_vessel
+                            result["is_resume"] = is_resume
+                            save_to_doc_tank(result, master_file.name, "master",
+                                             result.get("document_type", doc_type),
+                                             is_vessel, is_resume)
+                            st.session_state["popup"] = {
+                                "key": "master", "result": result,
+                                "filename": master_file.name, "source": "master",
+                                "target_section": target_sec,
+                                "tank_id": st.session_state["doc_tank"][-1]["tank_id"]
+                            }
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
     st.markdown("<hr style='margin:8px 0;border-color:#f1f5f9;'>", unsafe_allow_html=True)
 
@@ -1264,29 +1422,41 @@ elif st.session_state["page"] == "Doc Tank":
 
     if "dt_view" not in st.session_state:
         st.session_state["dt_view"] = "crew"
+    _crew_n   = len([d for d in tank if not d.get("is_vessel")])
+    _vessel_n = len([d for d in tank if d.get("is_vessel")])
     _dtb1, _dtb2, _ = st.columns([2, 2, 8])
     with _dtb1:
-        if st.button("Crew", key="dt_btn_crew", use_container_width=True,
-                     type="primary" if st.session_state["dt_view"] == "crew" else "secondary"):
-            st.session_state["dt_view"] = "crew"; st.rerun()
+        with st.container(key="dt_tab_crew"):
+            if st.button(f"Crew  {_crew_n}", key="dt_btn_crew", use_container_width=True,
+                         type="primary" if st.session_state["dt_view"] == "crew" else "secondary"):
+                st.session_state["dt_view"] = "crew"; st.rerun()
     with _dtb2:
-        if st.button("Vessel", key="dt_btn_vessel", use_container_width=True,
-                     type="primary" if st.session_state["dt_view"] == "vessel" else "secondary"):
-            st.session_state["dt_view"] = "vessel"; st.rerun()
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        with st.container(key="dt_tab_vessel"):
+            if st.button(f"Vessel  {_vessel_n}", key="dt_btn_vessel", use_container_width=True,
+                         type="primary" if st.session_state["dt_view"] == "vessel" else "secondary"):
+                st.session_state["dt_view"] = "vessel"; st.rerun()
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     _show_vessel = (st.session_state["dt_view"] == "vessel")
 
     if not tank:
         st.markdown('<div class="field-empty" style="text-align:center;padding:16px;">No documents processed yet.</div>', unsafe_allow_html=True)
     else:
-        s1, s2, s3, s4, s5, s6 = st.columns(6)
-        s1.metric("Total",    len(tank))
-        s2.metric("Pending",  len([d for d in tank if d.get("status")=="Pending"]))
-        s3.metric("Draft",    len([d for d in tank if d.get("status")=="Draft"]))
-        s4.metric("Approved", len([d for d in tank if d.get("status") in ("Approved","Partial")]))
-        s5.metric("Vessel",   len([d for d in tank if d.get("is_vessel")]))
-        s6.metric("CV/Resume",len([d for d in tank if d.get("is_resume")]))
-        st.markdown("---")
+        _n_total    = len(tank)
+        _n_pending  = len([d for d in tank if d.get("status")=="Pending"])
+        _n_draft    = len([d for d in tank if d.get("status")=="Draft"])
+        _n_approved = len([d for d in tank if d.get("status") in ("Approved","Partial")])
+        st.markdown(
+            '<div class="dt-stats-card">'
+            f'<div class="dt-stat"><div class="dt-stat-label">Total</div><div class="dt-stat-value">{_n_total}</div></div>'
+            f'<div class="dt-stat pending"><div class="dt-stat-label">Pending</div><div class="dt-stat-value">{_n_pending}</div></div>'
+            f'<div class="dt-stat draft"><div class="dt-stat-label">Draft</div><div class="dt-stat-value">{_n_draft}</div></div>'
+            f'<div class="dt-stat approved"><div class="dt-stat-label">Approved</div><div class="dt-stat-value">{_n_approved}</div></div>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+        st.caption(f"{_vessel_n} vessel cert(s)  ·  "
+                   f"{len([d for d in tank if d.get('is_resume')])} CV/Resume upload(s)")
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
         _filtered = [
             (len(tank)-1-i, doc)
             for i, doc in enumerate(reversed(tank))
@@ -1297,13 +1467,30 @@ elif st.session_state["page"] == "Doc Tank":
         else:
             for idx, doc in _filtered:
                 status     = doc.get("status", "Pending")
-                if status == "Approved":
-                    status_cls = "status-matched"
-                elif status in ("Partial", "Draft"):
-                    status_cls = "status-verify"
-                else:
-                    status_cls = "status-manual"
                 approved_fields = doc.get("approved_fields", [])
+
+                if doc.get("is_vessel"):
+                    _type_cls, _type_label = "dt-type-vessel", "Vessel Cert"
+                elif doc.get("is_resume"):
+                    _type_cls, _type_label = "dt-type-cv", "CV/Resume"
+                else:
+                    _sec_l = (doc.get("section_name","") or doc.get("document_type","")).lower()
+                    if "medical" in _sec_l:
+                        _type_cls, _type_label = "dt-type-medical", "Medical"
+                    elif "travel" in _sec_l or "passport" in _sec_l or "cdc" in _sec_l:
+                        _type_cls, _type_label = "dt-type-travel", "Travel Doc"
+                    elif "licen" in _sec_l or "certif" in _sec_l:
+                        _type_cls, _type_label = "dt-type-license", "License"
+                    else:
+                        _type_cls, _type_label = "dt-type-other", (doc.get("section_name") or "Document")
+
+                if status == "Approved" or status == "Partial":
+                    _dot_cls = "dt-status-approved"
+                elif status == "Draft":
+                    _dot_cls = "dt-status-draft"
+                else:
+                    _dot_cls = "dt-status-pending"
+
                 col_label, col_status, col_open, col_del = st.columns([4, 1, 1, 1])
                 with col_label:
                     _src      = doc.get("source", "")
@@ -1320,21 +1507,28 @@ elif st.session_state["page"] == "Doc Tank":
                     elif _src == "master" and doc.get("is_resume"):
                         _src_label = "Crew / Resume Upload"
                         _src_color = "#8b5cf6"
+                    elif _src == "smart_upload" and doc.get("is_resume"):
+                        _src_label = "Crew / AI Smart Upload (Resume)"
+                        _src_color = "#8b5cf6"
+                    elif _src == "smart_upload":
+                        _src_label = "Crew / AI Smart Upload"
+                        _src_color = "#8b5cf6"
                     else:
                         _src_label = "Doc Tank / Smart Import"
                         _src_color = "#64748b"
                     st.markdown(
                         f'<div style="padding:8px 0;">'
-                        f'<div style="font-size:0.85rem;font-weight:600;color:#1e293b;">{doc["filename"]}</div>'
-                        f'<div style="font-size:0.72rem;color:#64748b;">{doc["timestamp"]} &nbsp;|&nbsp; {doc["document_type"]}</div>'
+                        f'<div style="font-size:0.85rem;font-weight:600;color:#1e293b;">{doc["filename"]}'
+                        f'&nbsp;&nbsp;<span class="dt-type-pill {_type_cls}">{_type_label}</span></div>'
+                        f'<div style="font-size:0.72rem;color:#64748b;margin-top:2px;">{doc["timestamp"]} &nbsp;|&nbsp; {doc["document_type"]}</div>'
                         f'<div style="font-size:0.68rem;color:{_src_color};margin-top:2px;">&#x2022; {_src_label}</div>'
                         f'</div>',
                         unsafe_allow_html=True
                     )
                 with col_status:
                     st.markdown(
-                        f'<div style="padding-top:12px;">'
-                        f'<span class="{status_cls}">{status}</span>'
+                        f'<div style="padding-top:14px;">'
+                        f'<span class="dt-status-dot {_dot_cls}">{status}</span>'
                         f'</div>',
                         unsafe_allow_html=True
                     )
