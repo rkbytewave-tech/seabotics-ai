@@ -209,6 +209,7 @@ ALL_RANK_OPTIONS      = [
 ALL_SHIRT_SIZES       = ["XS", "S", "M", "L", "XL", "XXL", "XXXL"]
 ALL_TROUSER_SIZES     = ["XS", "S", "M", "L", "XL", "XXL", "XXXL"]
 ALL_BOILER_SUIT_SIZES = ["XS", "S", "M", "L", "XL", "XXL", "XXXL"]
+ALL_MARITAL_STATUS_OPTIONS = ["Single", "Married", "Divorced", "Widowed"]
 
 # ── SECTION DEFINITIONS ───────────────────────────────────────
 
@@ -225,6 +226,12 @@ PERSONAL_FIELDS = [
     ("height","Height"),("weight","Weight"),
     ("boiler_suit_size","Boiler Suit Size"),("safety_shoe_size","Safety Shoe Size"),
     ("shirt_size","Shirt Size"),("trouser_size","Trouser Size"),
+    ("marital_status","Marital Status"),
+    # India-only fields - only populated when nationality is India. See
+    # prompts.py personal blocks and api_mapping.py build_profile_payload()
+    # for the nationality gating logic.
+    ("indos_number","INDoS Number"),
+    ("pan_number","PAN Number"),("aadhar_number","Aadhar Number"),
 ]
 
 SECTION_COLUMNS = {
@@ -267,6 +274,7 @@ DROPDOWN_FIELDS = {
         "Shirt Size":       ALL_SHIRT_SIZES,
         "Trouser Size":     ALL_TROUSER_SIZES,
         "Boiler Suit Size": ALL_BOILER_SUIT_SIZES,
+        "Marital Status":   ALL_MARITAL_STATUS_OPTIONS,
     },
 }
 
@@ -294,7 +302,8 @@ ALL_ORG_OPTIONS = sorted(set([
     "Voyage Type","Sign On Port","Sign Off Port","GRT","DWT","BHP",
     "Main Engine Type / Model","Main Engine KW","Reason for Sign Off",
     "Certificate Name","Certificate Category","Classification Society",
-    "Date of Survey","Other / Unclassified"
+    "Date of Survey","Marital Status","INDoS Number","PAN Number","Aadhar Number",
+    "Other / Unclassified"
 ]))
 
 ORG_PREMAP = {
