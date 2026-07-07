@@ -10,7 +10,7 @@ from google import genai
 from google.genai import types
 import streamlit as st
 
-from config import GEMINI_API_KEY, MODEL_NAME, IMAGE_EXT
+from config import GEMINI_API_KEY, MODEL_NAME, LITE_MODEL_NAME, IMAGE_EXT
 from prompts import CLASSIFIER_PROMPT, VESSEL_PROMPT, RESUME_PROMPT, SECTION_PROMPTS
 
 
@@ -59,8 +59,59 @@ def extract_text(path):
     raise ValueError(f"Unsupported: {ext}")
 
 
-def _llm_call(system_prompt, user_text, max_tokens=4000, text_limit=30000):
+def _llm_vision_call(system_prompt, path, max_tokens=8000):
+    """Vision call - renders PDF pages as images and sends to Gemini Flash.
+    Used for resumes and sea service docs where table layout matters."""
+    doc = fitz.open(path)
+    image_parts = []
+    for page in doc:
+        pix = page.get_pixmap(dpi=150)  # 150 Dpi = 6 tiles/page = ~1548 tokens/page
+        image_parts.append(
+            types.Part.from_bytes(data=pix.tobytes("png"), mime_type="image/png")
+        )
+    doc.close()
+
+    if not image_parts:
+        return None
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=image_parts + [types.Part(text="Extract all information from these document pages.")]
+                    )
+                ],
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.1,
+                    max_output_tokens=max_tokens,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    response_mime_type="application/json",
+                )
+            )
+            raw = response.text.strip()
+            if not raw: continue
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+            start = raw.find("{"); end = raw.rfind("}") + 1
+            if start == -1 or end == 0: continue
+            return json.loads(raw[start:end])
+        except json.JSONDecodeError:
+            continue
+        except Exception as e:
+            st.error(f"API error: {e}")
+            return None
+    st.error("Pipeline failed after 3 attempts.")
+    return None
+
+
+def _llm_call(system_prompt, user_text, max_tokens=4000, text_limit=30000, model=None):
     """Core LLM caller - shared by all pipelines."""
+    model = model or MODEL_NAME
     if len(user_text) > text_limit:
         user_text = user_text[:text_limit]
     if not user_text.strip():
@@ -71,12 +122,14 @@ def _llm_call(system_prompt, user_text, max_tokens=4000, text_limit=30000):
     for attempt in range(3):
         try:
             response = client.models.generate_content(
-                model=MODEL_NAME,
+                model=model,
                 contents=f"Extract all information:\n\n{user_text}",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     temperature=0.1,
                     max_output_tokens=max_tokens,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    response_mime_type="application/json",
                 )
             )
             raw = response.text.strip()
@@ -97,22 +150,45 @@ def _llm_call(system_prompt, user_text, max_tokens=4000, text_limit=30000):
 
 def classify_document(text):
     """Step 1 for Master Upload - lightweight classifier, ~200 tokens."""
-    return _llm_call(CLASSIFIER_PROMPT, text, max_tokens=200, text_limit=3000)
+    return _llm_call(CLASSIFIER_PROMPT, text, max_tokens=200, text_limit=3000, model=LITE_MODEL_NAME)
 
 
-def call_llm(text, target_section=None, is_vessel=False, is_resume=False):
+# Sections needing Flash on the text path (complex tables)
+_FLASH_SECTIONS = {"Sea Service Experience"}
+
+# Sections that use Gemini vision even on digital PDFs (layout/table critical)
+_VISION_SECTIONS = {"Sea Service Experience"}
+
+
+def call_llm(text, target_section=None, is_vessel=False, is_resume=False, path=None):
     """
     Unified entry point.
     - target_section set  -> use section-specific prompt (1 call)
     - is_vessel = True    -> use vessel prompt (1 call)
     - is_resume = True    -> use resume prompt (1 call)
+    - path                -> if PDF, enables vision routing for eligible doc types
     - all None/False      -> full resume prompt as fallback
+
+    Vision routing (path must be a .pdf):
+    - Resumes always use vision - sea service tables need visual layout
+    - Sea service section upload also uses vision
+    - All other sections use text path (flat structure, PyMuPDF/Tesseract sufficient)
+
+    Model routing (text path):
+    - Flash (MODEL_NAME): resumes, sea service experience
+    - Flash-Lite (LITE_MODEL_NAME): classify, vessel certs, all flat sections
     """
+    use_vision = path and Path(path).suffix.lower() == ".pdf"
+
     if is_vessel:
-        return _llm_call(VESSEL_PROMPT, text, max_tokens=2000)
+        return _llm_call(VESSEL_PROMPT, text, max_tokens=2000, model=LITE_MODEL_NAME)
     if is_resume:
-        # Gemini 2.5 Flash: no TPM constraint - feed full text
-        return _llm_call(RESUME_PROMPT, text, max_tokens=8000, text_limit=50000)
+        if use_vision:
+            return _llm_vision_call(RESUME_PROMPT, path, max_tokens=8000)
+        return _llm_call(RESUME_PROMPT, text, max_tokens=8000, text_limit=50000, model=MODEL_NAME)
     if target_section and target_section in SECTION_PROMPTS:
-        return _llm_call(SECTION_PROMPTS[target_section], text, max_tokens=4000)
-    return _llm_call(RESUME_PROMPT, text, max_tokens=8000)
+        if use_vision and target_section in _VISION_SECTIONS:
+            return _llm_vision_call(SECTION_PROMPTS[target_section], path, max_tokens=4000)
+        m = MODEL_NAME if target_section in _FLASH_SECTIONS else LITE_MODEL_NAME
+        return _llm_call(SECTION_PROMPTS[target_section], text, max_tokens=4000, model=m)
+    return _llm_call(RESUME_PROMPT, text, max_tokens=8000, model=MODEL_NAME)
